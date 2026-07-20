@@ -1,0 +1,54 @@
+Low-Latency TCP Heartbeat Monitor -- throughput_bench
+heartbeat_interval=1000ms heartbeat_timeout=3000ms (shipped default, see config.h)  repetitions=3
+
+=== connection count ramp (epoll_max_events=256) ===
+N=10  epoll_max_events=256  hb_interval=1000ms  (3 repetitions)
+  epoll_wait/s: min=21.9993  median=22.4999  max=22.9999
+  events/s:     min=24.9992  median=24.9999  max=24.9999
+  setup:      min=0.0601254s  median=0.0603477s  max=0.060363s
+  steady_cpu: min=0.0636639%  median=0.0704847%  max=0.124849%
+  rss:        min=4.30469MB  median=4.37891MB  max=4.37891MB
+N=100  epoll_max_events=256  hb_interval=1000ms  (3 repetitions)
+  epoll_wait/s: min=20.9999  median=21.9999  max=22.4993
+  events/s:     min=69.9997  median=119.996  max=119.999
+  setup:      min=0.0608585s  median=0.0612123s  max=0.0615651s
+  steady_cpu: min=0.182652%  median=0.207579%  max=0.218446%
+  rss:        min=5.16016MB  median=5.37891MB  max=5.39062MB
+N=1000  epoll_max_events=256  hb_interval=1000ms  (3 repetitions)
+  epoll_wait/s: min=21.997  median=21.9993  max=21.9999
+  events/s:     min=519.929  median=519.983  max=519.998
+  setup:      min=0.0640129s  median=0.0677648s  max=0.0689411s
+  steady_cpu: min=0.909468%  median=0.910672%  max=0.997826%
+  rss:        min=11.8906MB  median=14.1992MB  max=14.1992MB
+N=5000  epoll_max_events=256  hb_interval=1000ms  (3 repetitions)
+  epoll_wait/s: min=29.9998  median=40.9986  max=467.496
+  events/s:     min=2519.98  median=2519.98  max=5019.83
+  setup:      min=1.11653s  median=1.12558s  max=1.17007s
+  steady_cpu: min=6.11722%  median=6.42902%  max=7.21755%
+  rss:        min=54.6211MB  median=70.832MB  max=70.8867MB
+
+=== epoll_max_events batch size (N=5000) ===
+N=5000  epoll_max_events=16  hb_interval=1000ms  (3 repetitions)
+  epoll_wait/s: min=182.481  median=197.487  max=485.495
+  events/s:     min=2612.23  median=2854.81  max=4568.45
+  setup:      min=1.05692s  median=1.15712s  max=1.15729s
+  steady_cpu: min=6.17349%  median=6.2629%  max=7.18064%
+  rss:        min=71.625MB  median=71.6289MB  max=71.6289MB
+N=5000  epoll_max_events=64  hb_interval=1000ms  (3 repetitions)
+  epoll_wait/s: min=59.4993  median=98.9992  max=567.497
+  events/s:     min=2519.97  median=4187.98  max=5019.96
+  setup:      min=1.11796s  median=1.11925s  max=1.13877s
+  steady_cpu: min=6.30029%  median=6.64024%  max=7.30237%
+  rss:        min=71.6289MB  median=72.2227MB  max=72.2227MB
+N=5000  epoll_max_events=256  hb_interval=1000ms  (3 repetitions)
+  epoll_wait/s: min=38.9996  median=39.4998  max=40.999
+  events/s:     min=4707.97  median=4763.95  max=5019.87
+  setup:      min=1.11719s  median=1.1175s  max=1.11809s
+  steady_cpu: min=6.42021%  median=6.61441%  max=7.16732%
+  rss:        min=72.2266MB  median=72.2266MB  max=72.2344MB
+N=5000  epoll_max_events=1024  hb_interval=1000ms  (3 repetitions)
+  epoll_wait/s: min=23.9999  median=24.4972  max=24.4999
+  events/s:     min=3880.06  median=3986.98  max=4038.48
+  setup:      min=1.1177s  median=1.11795s  max=1.11804s
+  steady_cpu: min=6.8267%  median=6.88038%  max=7.57085%
+  rss:        min=72.2344MB  median=72.2461MB  max=72.2461MB

@@ -1,0 +1,36 @@
+Low-Latency TCP Heartbeat Monitor -- throughput_bench
+heartbeat_interval=1000ms heartbeat_timeout=3000ms (shipped default, see config.h)  repetitions=3
+
+
+=== naive blocking-thread-per-connection baseline (same N, same cadence) ===
+N=10  (1 thread/connection)  hb_interval=1000ms  (3 repetitions)
+  setup:      min=0.0201035s  median=0.0201326s  max=0.020139s
+  steady_cpu: min=0.624731%  median=0.643799%  max=0.708094%
+  rss:        min=4.28125MB  median=4.41797MB  max=4.41797MB
+Low-Latency TCP Heartbeat Monitor -- throughput_bench
+heartbeat_interval=1000ms heartbeat_timeout=3000ms (shipped default, see config.h)  repetitions=3
+
+
+=== naive blocking-thread-per-connection baseline (same N, same cadence) ===
+N=100  (1 thread/connection)  hb_interval=1000ms  (3 repetitions)
+  setup:      min=0.0208767s  median=0.0209807s  max=0.0211593s
+  steady_cpu: min=1.09137%  median=1.22822%  max=1.28047%
+  rss:        min=5.44531MB  median=5.66797MB  max=5.67188MB
+Low-Latency TCP Heartbeat Monitor -- throughput_bench
+heartbeat_interval=1000ms heartbeat_timeout=3000ms (shipped default, see config.h)  repetitions=3
+
+
+=== naive blocking-thread-per-connection baseline (same N, same cadence) ===
+N=1000  (1 thread/connection)  hb_interval=1000ms  (3 repetitions)
+  setup:      min=0.0341054s  median=0.0542634s  max=0.0549493s
+  steady_cpu: min=7.02631%  median=7.28013%  max=7.88288%
+  rss:        min=16.4336MB  median=16.6211MB  max=16.625MB
+Low-Latency TCP Heartbeat Monitor -- throughput_bench
+heartbeat_interval=1000ms heartbeat_timeout=3000ms (shipped default, see config.h)  repetitions=3
+
+
+=== naive blocking-thread-per-connection baseline (same N, same cadence) ===
+N=5000  (1 thread/connection)  hb_interval=1000ms  (3 repetitions)
+  setup:      min=0.164167s  median=0.17153s  max=0.220602s
+  steady_cpu: min=31.1869%  median=31.5084%  max=32.4525%
+  rss:        min=65.3125MB  median=65.5469MB  max=65.5508MB
