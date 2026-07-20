@@ -1,0 +1,11 @@
+build/
+bin/
+*.o
+*.d
+*.gcda
+*.gcno
+*.gcov
+crash-*
+leak-*
+oom-*
+.claude/
