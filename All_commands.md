@@ -19,7 +19,7 @@ Every command used to build, test, verify and benchmark the project, grouped by 
 make all                 # bin/feed_monitor and bin/feed_simulator
 make test                # builds bin/run_tests (plus the two binaries it exec()s) and runs it: 178 tests
 ./bin/run_tests          # run the already-built suite directly
-make bench               # bin/latency_bench and bin/throughput_bench
+make bench               # bin/latency_bench, bin/throughput_bench and bin/raw_socket_baseline
 make demo                # bin/lifecycle_demo
 make fuzz                # bin/decode_heartbeat_fuzz and bin/drain_read_buffer_fuzz (clang++ only)
 make clean               # removes build/, bin/, build-werror/, bin-werror/, fuzz-work/, fuzz-artifacts/
@@ -89,6 +89,9 @@ make fuzz                                # build both harnesses (ASan + UBSan, U
 # dictionary, -close_fd_mask=3 and a hard timeout. New inputs go to fuzz-work/, crashes and
 # hangs to fuzz-artifacts/; the committed corpus is never modified.
 make fuzz-smoke FUZZ_TIME=30
+
+# the longer run behind fuzz/RESULTS.txt: 600 s per harness, run one after the other (about 20 minutes)
+make fuzz-smoke FUZZ_TIME=600
 
 # by hand (the first corpus directory is the writable one)
 mkdir -p fuzz-work/decode fuzz-artifacts
@@ -196,6 +199,10 @@ make bench
 # heartbeat round-trip latency; args: <measured_round_trips> <warmup> <repetitions>
 ./bin/latency_bench 20000 500 5
 
+# kernel-floor reference: the same 28-byte ping/pong over loopback with bare send/epoll_wait/recv
+# (no framing, CRC or state machine); same arguments. Compare it with latency_bench from the same session.
+./bin/raw_socket_baseline 20000 500 5
+
 # epoll reactor connection-count ramp; the epoll_max_events batch-size sweep at the largest N runs in the same invocation
 # args: <comma-separated counts> [heartbeat_interval_ms [repetitions]]
 ./bin/throughput_bench 10,100,1000,5000 1000 5
@@ -214,7 +221,7 @@ bash scripts/run_benchmarks_and_plot.sh
 LAT_ISOLATED_CPUS=4 THROUGHPUT_CPUS=6-9,11 REPS=5 bash scripts/run_benchmarks_and_plot.sh
 ```
 
-In order: best-effort governor change (needs `cpupower` and passwordless `sudo`; restored on exit), `make clean && make all && make bench`, best-effort `setcap cap_sys_nice+ep bin/latency_bench`, `latency_bench`, optionally the isolated-core latency run, the epoll ramp, then the naive runs, then `scripts/generate_key_graphs.py`. Raw output goes to a temporary directory and replaces `bench/results/*.txt` and `bench/charts/*.png` only if every step succeeded. It also writes `bench/results/environment_snapshot.txt` and warns if the thermal-throttle counter rose during a run. Run time is roughly 10 minutes.
+In order: best-effort governor change (needs `cpupower` and passwordless `sudo`; restored on exit), `make clean && make all && make bench`, best-effort `setcap cap_sys_nice+ep bin/latency_bench`, `latency_bench`, optionally the isolated-core latency run, `raw_socket_baseline`, the epoll ramp, then the naive runs, then `scripts/generate_key_graphs.py`. Raw output goes to a temporary directory and replaces `bench/results/*.txt` (including `raw_socket_baseline.txt`) and `bench/charts/*.png` only if every step succeeded. It also writes `bench/results/environment_snapshot.txt` and warns if the thermal-throttle counter rose during a run. Run time is roughly 10 minutes.
 
 | Variable | Meaning | Default |
 |---|---|---|
@@ -231,6 +238,7 @@ In order: best-effort governor change (needs `cpupower` and passwordless `sudo`;
 ```bash
 mkdir -p bench/results
 ./bin/latency_bench 20000 500 5 | tee bench/results/latency_bench.txt                          # client pinned to CPU 0 (P-core)
+./bin/raw_socket_baseline 20000 500 5 | tee bench/results/raw_socket_baseline.txt              # kernel floor, same placement
 taskset -c 4 ./bin/latency_bench 20000 500 5 | tee bench/results/latency_bench_isolated.txt    # isolated E-core
 
 # same CPU mask for epoll and naive so the comparison is fair; non-isolated cores only
@@ -287,11 +295,11 @@ make clean && make all && make test                     # plain build + full sui
 make debug                                              # ASan + UBSan
 make clean && make SANITIZE=thread OPT="-O1 -g" test    # TSan
 make werror && make CXX=clang++ werror                  # -Werror on both compilers (separate build dirs)
-make bench                                              # latency_bench + throughput_bench
-bash scripts/run_benchmarks_and_plot.sh                 # run, save and chart all benchmarks
+make bench                                              # latency_bench, throughput_bench, raw_socket_baseline
+bash scripts/run_benchmarks_and_plot.sh                 # run (incl. raw-socket baseline), save and chart all benchmarks
 make demo && ./bin/lifecycle_demo                       # 3-feed live isolation proof
 make coverage                                           # gcov per-file line %
-make fuzz-smoke FUZZ_TIME=60                            # libFuzzer, seeded corpus (needs clang++)
+make fuzz-smoke FUZZ_TIME=60                            # libFuzzer, seeded corpus (needs clang++); 600 for the recorded run
 clang-tidy src/*.cpp -- -std=c++20 -Isrc                # static analysis
 sudo ./scripts/network_fault_demo.sh                    # real tc/netem packet loss
 
