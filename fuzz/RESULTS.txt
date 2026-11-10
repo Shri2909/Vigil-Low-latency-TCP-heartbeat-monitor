@@ -1,0 +1,15 @@
+Recorded fuzz run (2026-11-10, 20:14:36 to 20:24:38 +05:30)
+=========================================================
+Build    : clang++ -O1 -g -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined (make fuzz), commit d37aa16
+Command  : ./bin/<harness> -max_total_time=600 -close_fd_mask=3 -dict=fuzz/heartbeat.dict <working corpus seeded from fuzz/corpus/<harness>/>
+           (both harnesses ran concurrently, one process each; machine governor: powersave; no other benchmarks running)
+
+decode_heartbeat_fuzz   (frame decoder: decode succeeds => re-encode round-trips)
+  76,231,442 executions in 601 s (~127k exec/s)   cov: 18   ft: 25   corpus: 7 inputs (196 B)   no crash, leak or timeout
+drain_read_buffer_fuzz  (full Connection stream parser, both roles, chunked reads, scripted handshake)
+  4,590,399 executions in 601 s (~7.6k exec/s)    cov: 232  ft: 932  corpus: 119 inputs (71 KB)  no crash, leak or timeout
+
+Seeds committed: 11 (decode) + 27 (drain) valid-CRC and malformed frames, plus a magic-byte dictionary.
+Coverage did not move for the decoder after the first seconds (the decoder is a 28-byte pure function), and the stream
+parser grew its corpus from 27 to 119 inputs. "No findings" is for this run only; fuzzing is time-boxed, not continuous.
+Reproduce: make fuzz-smoke FUZZ_TIME=600

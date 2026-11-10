@@ -1,0 +1,124 @@
+# session: 2026-11-10T20:13:44+05:30 governor=powersave AC=1 temp_before=56000 throttle_before=1059
+# all four runs: no taskset (client pinned to CPU 0 by the benchmark), no SCHED_FIFO (no cap_sys_nice on these binaries), run back to back
+
+=== round 1: raw_socket_baseline ===
+Raw-socket loopback baseline -- raw_socket_baseline
+warmup=500 measured=20000 repetitions=5 (loopback, 28-byte messages, tcp_nodelay=true)
+
+rep 1 raw sockets (20000 samples)
+  min=5.95us  p50=6.08us  p90=6.21us  p99=7.63us  p99.9=9.53us  max=175.66us
+rep 2 raw sockets (20000 samples)
+  min=5.92us  p50=6.05us  p90=6.14us  p99=7.95us  p99.9=148.08us  max=220.71us
+rep 3 raw sockets (20000 samples)
+  min=5.94us  p50=6.08us  p90=6.16us  p99=7.46us  p99.9=9.48us  max=152.74us
+rep 4 raw sockets (20000 samples)
+  min=5.94us  p50=6.09us  p90=6.17us  p99=7.16us  p99.9=8.82us  max=22.92us
+rep 5 raw sockets (20000 samples)
+  min=5.93us  p50=6.06us  p90=6.12us  p99=6.70us  p99.9=8.62us  max=10.69us
+
+raw sockets across 5 repetitions (the 'max' of each row is the worst repetition):
+  p50  : min=6.05us median=6.08us max=6.09us
+  p90  : min=6.12us median=6.16us max=6.21us
+  p99  : min=6.70us median=7.46us max=7.95us
+  p99.9: min=8.62us median=9.48us max=148.08us
+  max  : min=10.69us median=152.74us max=220.71us
+
+=== round 1: latency_bench (tcp_nodelay=true section is the comparable one) ===
+Low-Latency TCP Heartbeat Monitor -- latency_bench
+warmup=500 measured=20000 repetitions=5 (loopback)
+
+rep 1 tcp_nodelay=true  (20000 samples)
+  min=6.02us  p50=6.15us  p90=6.23us  p99=7.49us  p99.9=9.80us  max=158.79us
+rep 1 tcp_nodelay=false (20000 samples)
+  min=6.05us  p50=6.19us  p90=6.28us  p99=7.68us  p99.9=9.39us  max=152.04us
+rep 2 tcp_nodelay=false (20000 samples)
+  min=5.84us  p50=6.16us  p90=6.24us  p99=7.40us  p99.9=8.84us  max=11.61us
+rep 2 tcp_nodelay=true  (20000 samples)
+  min=5.93us  p50=6.16us  p90=6.24us  p99=7.62us  p99.9=9.47us  max=27.28us
+rep 3 tcp_nodelay=true  (20000 samples)
+  min=6.01us  p50=6.16us  p90=6.24us  p99=7.15us  p99.9=8.91us  max=19.63us
+rep 3 tcp_nodelay=false (20000 samples)
+  min=6.00us  p50=6.18us  p90=6.31us  p99=7.67us  p99.9=9.53us  max=158.00us
+rep 4 tcp_nodelay=false (20000 samples)
+  min=5.55us  p50=6.16us  p90=6.24us  p99=7.45us  p99.9=9.10us  max=151.99us
+rep 4 tcp_nodelay=true  (20000 samples)
+  min=6.03us  p50=6.18us  p90=6.27us  p99=7.54us  p99.9=9.28us  max=169.03us
+rep 5 tcp_nodelay=true  (20000 samples)
+  min=6.00us  p50=6.14us  p90=6.22us  p99=7.35us  p99.9=8.92us  max=11.93us
+rep 5 tcp_nodelay=false (20000 samples)
+  min=6.04us  p50=6.18us  p90=6.26us  p99=7.48us  p99.9=9.04us  max=36.77us
+
+tcp_nodelay=true  across 5 repetitions (the 'max' of each row is the worst repetition):
+  p50  : min=6.14us median=6.16us max=6.18us
+  p90  : min=6.22us median=6.24us max=6.27us
+  p99  : min=7.15us median=7.49us max=7.62us
+  p99.9: min=8.91us median=9.28us max=9.80us
+  max  : min=11.93us median=27.28us max=169.03us
+tcp_nodelay=false across 5 repetitions (the 'max' of each row is the worst repetition):
+  p50  : min=6.16us median=6.18us max=6.19us
+  p90  : min=6.24us median=6.26us max=6.31us
+  p99  : min=7.40us median=7.48us max=7.68us
+  p99.9: min=8.84us median=9.10us max=9.53us
+  max  : min=11.61us median=151.99us max=158.00us
+
+=== round 2: raw_socket_baseline ===
+Raw-socket loopback baseline -- raw_socket_baseline
+warmup=500 measured=20000 repetitions=5 (loopback, 28-byte messages, tcp_nodelay=true)
+
+rep 1 raw sockets (20000 samples)
+  min=5.95us  p50=6.13us  p90=6.22us  p99=7.60us  p99.9=9.54us  max=175.52us
+rep 2 raw sockets (20000 samples)
+  min=6.02us  p50=6.14us  p90=6.21us  p99=7.22us  p99.9=9.03us  max=16.15us
+rep 3 raw sockets (20000 samples)
+  min=5.95us  p50=6.08us  p90=6.17us  p99=7.34us  p99.9=8.84us  max=152.55us
+rep 4 raw sockets (20000 samples)
+  min=5.91us  p50=6.05us  p90=6.17us  p99=8.15us  p99.9=9.46us  max=160.64us
+rep 5 raw sockets (20000 samples)
+  min=5.92us  p50=6.12us  p90=6.21us  p99=7.68us  p99.9=9.78us  max=168.46us
+
+raw sockets across 5 repetitions (the 'max' of each row is the worst repetition):
+  p50  : min=6.05us median=6.12us max=6.14us
+  p90  : min=6.17us median=6.21us max=6.22us
+  p99  : min=7.22us median=7.60us max=8.15us
+  p99.9: min=8.84us median=9.46us max=9.78us
+  max  : min=16.15us median=160.64us max=175.52us
+
+=== round 2: latency_bench (tcp_nodelay=true section is the comparable one) ===
+Low-Latency TCP Heartbeat Monitor -- latency_bench
+warmup=500 measured=20000 repetitions=5 (loopback)
+
+rep 1 tcp_nodelay=true  (20000 samples)
+  min=6.04us  p50=6.15us  p90=6.23us  p99=7.50us  p99.9=9.05us  max=89.29us
+rep 1 tcp_nodelay=false (20000 samples)
+  min=6.02us  p50=6.15us  p90=6.23us  p99=7.31us  p99.9=9.19us  max=151.53us
+rep 2 tcp_nodelay=false (20000 samples)
+  min=6.02us  p50=6.15us  p90=6.22us  p99=7.19us  p99.9=9.36us  max=151.31us
+rep 2 tcp_nodelay=true  (20000 samples)
+  min=6.05us  p50=6.17us  p90=6.26us  p99=7.67us  p99.9=9.06us  max=80.44us
+rep 3 tcp_nodelay=true  (20000 samples)
+  min=5.92us  p50=6.14us  p90=6.22us  p99=7.52us  p99.9=9.15us  max=12.67us
+rep 3 tcp_nodelay=false (20000 samples)
+  min=5.57us  p50=6.16us  p90=6.24us  p99=7.35us  p99.9=9.34us  max=15.78us
+rep 4 tcp_nodelay=false (20000 samples)
+  min=5.64us  p50=6.14us  p90=6.22us  p99=7.53us  p99.9=8.84us  max=155.09us
+rep 4 tcp_nodelay=true  (20000 samples)
+  min=5.75us  p50=6.12us  p90=6.21us  p99=7.52us  p99.9=8.93us  max=83.88us
+rep 5 tcp_nodelay=true  (20000 samples)
+  min=6.02us  p50=6.13us  p90=6.20us  p99=7.23us  p99.9=8.89us  max=149.86us
+rep 5 tcp_nodelay=false (20000 samples)
+  min=6.04us  p50=6.16us  p90=6.23us  p99=7.49us  p99.9=9.45us  max=158.21us
+
+tcp_nodelay=true  across 5 repetitions (the 'max' of each row is the worst repetition):
+  p50  : min=6.12us median=6.14us max=6.17us
+  p90  : min=6.20us median=6.22us max=6.26us
+  p99  : min=7.23us median=7.52us max=7.67us
+  p99.9: min=8.89us median=9.05us max=9.15us
+  max  : min=12.67us median=83.88us max=149.86us
+tcp_nodelay=false across 5 repetitions (the 'max' of each row is the worst repetition):
+  p50  : min=6.14us median=6.15us max=6.16us
+  p90  : min=6.22us median=6.23us max=6.24us
+  p99  : min=7.19us median=7.35us max=7.53us
+  p99.9: min=8.84us median=9.34us max=9.45us
+  max  : min=15.78us median=151.53us max=158.21us
+
+# throttle_after=1059

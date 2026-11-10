@@ -27,3 +27,11 @@ Runs   (reproduce with scripts/run_benchmarks_and_plot.sh: LAT_ISOLATED_CPUS=4 T
 
 Caveats: laptop under sustained load runs warm (package 61-78 C during the session); VS Code was open but idle;
 CPU frequency was not pinned or measured with turbostat. Treat absolute values as "this machine, this session".
+
+Kernel-floor baseline (raw_socket_baseline.txt), measured later the same day after a reboot
+  raw_socket_baseline.txt        : two back-to-back rounds of `./bin/raw_socket_baseline 20000 500 5` (bare send/epoll_wait/recv
+                                   echo, same 28-byte messages, no framing/CRC/state machine) and `./bin/latency_bench 20000 500 5`
+                                   in the same session, no taskset (client pinned to CPU 0 by the benchmark). The governor had
+                                   reverted to powersave after the reboot, and neither binary had cap_sys_nice (no SCHED_FIFO),
+                                   so these runs are comparable with each other but not identical to latency_bench.txt above.
+                                   Package throttle counter 1059 -> 1059 (no throttling), package ~56 C before the runs.
