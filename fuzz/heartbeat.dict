@@ -1,0 +1,12 @@
+# libFuzzer dictionary for the 28-byte heartbeat wire format
+# (see src/heartbeat.h): magic 0xFEED, version 1, then message type 1..5.
+magic="\xFE\xED"
+magic_version="\xFE\xED\x01"
+hello_prefix="\xFE\xED\x01\x01"
+ack_prefix="\xFE\xED\x01\x02"
+ping_prefix="\xFE\xED\x01\x03"
+pong_prefix="\xFE\xED\x01\x04"
+disconnect_prefix="\xFE\xED\x01\x05"
+feed_id_1="\x00\x00\x00\x01"
+seq_zero="\x00\x00\x00\x00\x00\x00\x00\x00"
+seq_max="\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF"
