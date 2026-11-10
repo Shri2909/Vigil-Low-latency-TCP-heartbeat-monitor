@@ -1,18 +1,10 @@
-// Measures how FeedMonitor's epoll reactor scales with connection count:
-// time to bring N connections to HEALTHY, steady-state CPU and RSS, and the
-// effect of epoll_max_events batch size. See PROJECT_PLAN.md section 12.
+// Epoll reactor scaling: time to bring N connections to HEALTHY, steady-state CPU
+// and RSS, and the effect of epoll_max_events; optionally vs a naive
+// thread-per-connection baseline.
+// Run: ./bin/throughput_bench [--naive|--naive-only] [counts_csv [interval_ms [reps]]]
 //
-// Needs a peer that can answer many distinct feed_ids on one port.
-// FeedSimulator (src/feed_simulator.h) is intentionally one feed per
-// instance -- each simulator represents one exchange -- so ramping to
-// thousands of distinct feed_ids would mean thousands of FeedSimulator
-// instances (thousands of OS threads/listening sockets), which would measure
-// thread-scheduling overhead from the *benchmark's own scaffolding*, not
-// FeedMonitor. Instead, MultiFeedEchoPeer below answers on one port for any
-// feed_id, using heartbeat.h's encode/decode directly rather than the full
-// Connection class -- Connection's feed_id must be fixed at construction,
-// before the first byte (which carries the feed_id) has even been read, so
-// it structurally can't serve this role.
+// MultiFeedEchoPeer answers any feed_id on one port, since FeedSimulator is one
+// feed per instance and thousands of simulators would benchmark the scaffolding.
 
 #include "bench_common.h"
 #include "epoll_utils.h"
@@ -22,16 +14,15 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
-#include <cstring>
 #include <iostream>
 #include <memory>
-#include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -123,7 +114,7 @@ private:
                 if (errno == EINTR) continue;
                 break;
             }
-            clients_[fd];
+            clients_[fd];  // creates the empty receive buffer
             epoll_event ev{};
             ev.events = EPOLLIN;
             ev.data.fd = fd;
@@ -184,15 +175,11 @@ private:
                 reply.sequence = msg.sequence;
                 reply.timestamp_ns = msg.timestamp_ns;
             } else {
-                continue;  // this echo peer only answers hello/ping, benchmark never sends anything else
+                continue;  // only hello/ping are ever sent
             }
             HeartbeatWireBuffer out_wire;
             encode_heartbeat(reply, out_wire);
-            // Best-effort single send: a 28-byte reply on a freshly-accepted
-            // socket's send buffer essentially never partial-writes at this
-            // scale, and this peer exists to generate load, not to
-            // demonstrate partial-write handling (Connection already has
-            // dedicated coverage for that in connection_test.cpp).
+            // Best-effort send: a 28-byte reply never partial-writes at this scale.
             ::send(fd, out_wire.data(), out_wire.size(), MSG_NOSIGNAL);
         }
         if (offset > 0) {
@@ -209,9 +196,6 @@ private:
 };
 
 struct ThroughputResult {
-    size_t connection_count = 0;
-    int epoll_max_events = 0;
-    int64_t heartbeat_interval_ms = 0;
     bool all_healthy = false;
     double setup_seconds = 0.0;
     double cpu_percent = 0.0;
@@ -220,15 +204,8 @@ struct ThroughputResult {
     double events_per_sec = 0.0;
 };
 
-// CPU-seconds consumed by one specific thread so far, via its own
-// CPU-time clockid -- not process-wide getrusage(RUSAGE_SELF, ...), which
-// can't separate FeedMonitor's reactor thread from MultiFeedEchoPeer's
-// thread (both live in this benchmark's own process) and so overstated
-// every reported steady_cpu% by however much the echo peer itself cost
-// (PROJECT_PLAN.md F8). Returns 0.0 if the clockid lookup fails (e.g. the
-// thread has already exited), which is treated as "no CPU time observed"
-// rather than a fatal error since this is benchmark instrumentation, not
-// correctness-critical code.
+// CPU-seconds used by one thread (per-thread clock, not process-wide rusage,
+// which would include the echo peer). Returns 0.0 if the lookup fails.
 double thread_cpu_seconds(pthread_t thread) {
     clockid_t clock_id;
     if (::pthread_getcpuclockid(thread, &clock_id) != 0) {
@@ -241,15 +218,27 @@ double thread_cpu_seconds(pthread_t thread) {
     return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
 }
 
+// Steady-state window, in heartbeat periods. Pings fire in near-lockstep
+// bursts, so a short window can catch a varying number of bursts and swing
+// CPU% and events/s by 2x; a whole number of periods bounds the error to +-1
+// burst in kWindowPeriods (~10%). The settle skips the connect transient.
+constexpr int kSettlePeriods = 1;
+constexpr int kWindowPeriods = 10;
+
+std::chrono::milliseconds window_for(std::chrono::milliseconds heartbeat_interval) {
+    return std::max(heartbeat_interval * kWindowPeriods, std::chrono::milliseconds(2000));
+}
+std::chrono::milliseconds settle_for(std::chrono::milliseconds heartbeat_interval) {
+    return heartbeat_interval * kSettlePeriods;
+}
+
 ThroughputResult run_throughput_trial(size_t connection_count, int epoll_max_events,
                                        std::chrono::milliseconds heartbeat_interval,
                                        std::chrono::milliseconds heartbeat_timeout) {
     MultiFeedEchoPeer peer(0);
     const uint16_t port = peer.port();
-    // Both threads below would otherwise silently inherit main()'s
-    // single-CPU pin (see bench::reset_affinity_unpinned's doc comment),
-    // forcing the peer and the monitor under test onto the same core and
-    // adding contention noise to exactly what's being measured.
+    // Spawned threads call reset_affinity_unpinned() so they never inherit an
+    // RT policy or a narrowed mask (a no-op unless launched with chrt/pinning).
     std::thread peer_thread([&peer] {
         bench::reset_affinity_unpinned();
         peer.run();
@@ -262,12 +251,10 @@ ThroughputResult run_throughput_trial(size_t connection_count, int epoll_max_eve
 
     FeedMonitor monitor(config);
 
-    std::mutex mu;
-    AggregateStats last_snapshot;
-    monitor.set_tick_callback([&](const AggregateStats& s) {
-        std::lock_guard<std::mutex> lock(mu);
-        last_snapshot = s;
-    });
+    // Keep the callback trivial (one relaxed store) so it adds no measured cost.
+    std::atomic<size_t> healthy_count{0};
+    monitor.set_tick_callback(
+        [&healthy_count](const AggregateStats& s) { healthy_count.store(s.healthy_count, std::memory_order_relaxed); });
 
     const int64_t setup_start = now_monotonic_ns();
     for (size_t i = 0; i < connection_count; ++i) {
@@ -283,22 +270,20 @@ ThroughputResult run_throughput_trial(size_t connection_count, int epoll_max_eve
     bool all_healthy = false;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (std::chrono::steady_clock::now() < deadline) {
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            if (last_snapshot.healthy_count == connection_count) {
-                all_healthy = true;
-                break;
-            }
+        if (healthy_count.load(std::memory_order_relaxed) == connection_count) {
+            all_healthy = true;
+            break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     const int64_t setup_end = now_monotonic_ns();
+    std::this_thread::sleep_for(settle_for(heartbeat_interval));  // skip the connect/handshake transient
 
     const double cpu_before = thread_cpu_seconds(monitor_thread.native_handle());
     const uint64_t epoll_wait_before = monitor.debug_epoll_wait_count();
     const uint64_t events_before = monitor.debug_events_processed_count();
     const int64_t window_start = now_monotonic_ns();
-    std::this_thread::sleep_for(std::chrono::seconds(2));  // steady-state measurement window
+    std::this_thread::sleep_for(window_for(heartbeat_interval));  // steady-state measurement window
     const double cpu_after = thread_cpu_seconds(monitor_thread.native_handle());
     const uint64_t epoll_wait_after = monitor.debug_epoll_wait_count();
     const uint64_t events_after = monitor.debug_events_processed_count();
@@ -308,18 +293,12 @@ ThroughputResult run_throughput_trial(size_t connection_count, int epoll_max_eve
     const double cpu_delta = cpu_after - cpu_before;
     const double cpu_percent = wall_seconds > 0.0 ? (cpu_delta / wall_seconds) * 100.0 : 0.0;
     const int64_t rss = bench::current_rss_bytes();
-    // PROJECT_PLAN.md section 12 promised this pair of metrics from the
-    // start; throughput_bench never actually measured them until this pass.
     const double epoll_wait_calls_per_sec =
         wall_seconds > 0.0 ? static_cast<double>(epoll_wait_after - epoll_wait_before) / wall_seconds : 0.0;
     const double events_per_sec =
         wall_seconds > 0.0 ? static_cast<double>(events_after - events_before) / wall_seconds : 0.0;
 
-    size_t final_healthy;
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        final_healthy = last_snapshot.healthy_count;
-    }
+    const size_t final_healthy = healthy_count.load(std::memory_order_relaxed);
 
     monitor.stop();
     monitor_thread.join();
@@ -332,10 +311,7 @@ ThroughputResult run_throughput_trial(size_t connection_count, int epoll_max_eve
     }
 
     ThroughputResult result;
-    result.connection_count = connection_count;
-    result.epoll_max_events = epoll_max_events;
-    result.heartbeat_interval_ms = heartbeat_interval.count();
-    result.all_healthy = all_healthy;
+    result.all_healthy = all_healthy && final_healthy == connection_count;
     result.setup_seconds = static_cast<double>(setup_end - setup_start) / 1e9;
     result.cpu_percent = cpu_percent;
     result.rss_bytes = rss;
@@ -344,13 +320,17 @@ ThroughputResult run_throughput_trial(size_t connection_count, int epoll_max_eve
     return result;
 }
 
-// Runs run_throughput_trial `repetitions` times for one (connection_count,
-// epoll_max_events) pair and prints the min/median/max spread across those
-// repetitions for the metrics that vary run to run (setup time, steady-state
-// CPU%, RSS) -- neither benchmark repeated a configuration before this audit
-// pass, so every number was a single-sample point estimate with no reported
-// variance (PROJECT_PLAN.md F10).
-void run_and_print_repeated(size_t connection_count, int epoll_max_events,
+void print_setup_cpu_rss(const bench::Spread& setup, const bench::Spread& cpu, const bench::Spread& rss) {
+    std::cout << "  setup:      min=" << setup.min << "s  median=" << setup.median << "s  max=" << setup.max << "s\n"
+              << "  steady_cpu: min=" << cpu.min << "%  median=" << cpu.median << "%  max=" << cpu.max << "%\n"
+              << "  rss:        min=" << (rss.min / (1024 * 1024)) << "MB  median=" << (rss.median / (1024 * 1024))
+              << "MB  max=" << (rss.max / (1024 * 1024)) << "MB\n";
+}
+
+// Runs the trial `repetitions` times and prints min/median/max per metric
+// (format parsed by scripts/generate_key_graphs.py). Returns false if any
+// repetition did not bring every connection to HEALTHY.
+bool run_and_print_repeated(size_t connection_count, int epoll_max_events,
                              std::chrono::milliseconds heartbeat_interval,
                              std::chrono::milliseconds heartbeat_timeout, size_t repetitions) {
     const auto results = bench::repeat_trials(
@@ -368,11 +348,9 @@ void run_and_print_repeated(size_t connection_count, int epoll_max_events,
               << "  hb_interval=" << heartbeat_interval.count() << "ms"
               << "  (" << repetitions << " repetitions)" << (all_healthy ? "" : "  [INCOMPLETE on some repetition]") << "\n"
               << "  epoll_wait/s: min=" << waits.min << "  median=" << waits.median << "  max=" << waits.max << "\n"
-              << "  events/s:     min=" << events.min << "  median=" << events.median << "  max=" << events.max << "\n"
-              << "  setup:      min=" << setup.min << "s  median=" << setup.median << "s  max=" << setup.max << "s\n"
-              << "  steady_cpu: min=" << cpu.min << "%  median=" << cpu.median << "%  max=" << cpu.max << "%\n"
-              << "  rss:        min=" << (rss.min / (1024 * 1024)) << "MB  median=" << (rss.median / (1024 * 1024))
-              << "MB  max=" << (rss.max / (1024 * 1024)) << "MB\n";
+              << "  events/s:     min=" << events.min << "  median=" << events.median << "  max=" << events.max << "\n";
+    print_setup_cpu_rss(setup, cpu, rss);
+    return all_healthy;
 }
 
 void raise_fd_limit() {
@@ -384,24 +362,38 @@ void raise_fd_limit() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Naive blocking-thread-per-connection baseline (PROJECT_PLAN.md section 12
-// asked for an epoll-vs-blocking-I/O comparison; it was scoped out at build
-// time as "real work, out of proportion to what's left" -- built here since
-// it's now specifically what's being asked for). One real OS thread per
-// connection, each doing a blocking connect() + blocking handshake + a
-// blocking send-PING/recv-PONG loop paced by heartbeat_interval. This is
-// deliberately the simplest possible correct implementation of "watch N
-// feeds without an event loop" -- exactly the naive baseline the comparison
-// needs to be meaningful, not a tuned alternative architecture.
-// ---------------------------------------------------------------------------
+// --- Naive baseline: one blocking thread per connection (connect, handshake,
+// then a send-PING / recv-PONG loop paced by heartbeat_interval). ---
 
 struct NaiveWorkerState {
     std::atomic<bool> connected{false};
 };
 
+// Sleeps up to `interval` in one poll(), returning true early if stop_fd is
+// readable. The shutdown eventfd is written once and never drained, so it wakes
+// every sleeping worker. One wakeup per period per thread keeps the baseline fair.
+bool sleep_or_stop(int stop_fd, std::chrono::milliseconds interval) {
+    pollfd p{};
+    p.fd = stop_fd;
+    p.events = POLLIN;
+    const auto deadline = std::chrono::steady_clock::now() + interval;
+    while (true) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+        if (remaining.count() <= 0) {
+            return false;
+        }
+        const int rc = ::poll(&p, 1, static_cast<int>(remaining.count()));
+        if (rc > 0) {
+            return true;
+        }
+        if (rc < 0 && errno != EINTR) {
+            return true;  // unexpected poll failure: treat as stop rather than spin
+        }
+    }
+}
+
 void naive_worker(uint16_t port, std::chrono::milliseconds heartbeat_interval, std::atomic<bool>& stop_flag,
-                   NaiveWorkerState& state) {
+                   int stop_fd, NaiveWorkerState& state) {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);  // blocking socket, no SOCK_NONBLOCK
     if (fd < 0) {
         return;
@@ -415,10 +407,7 @@ void naive_worker(uint16_t port, std::chrono::milliseconds heartbeat_interval, s
         return;
     }
 
-    // Bounds every blocking recv() so this thread still notices stop_flag
-    // rather than blocking forever if the peer never replies -- a benchmark
-    // worker concern, not something production code needs (Connection is
-    // non-blocking and never calls recv() without epoll saying it's ready).
+    // Bound blocking recv() so the worker still notices stop_flag if the peer goes quiet.
     timeval tv{2, 0};
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
@@ -477,20 +466,14 @@ void naive_worker(uint16_t port, std::chrono::milliseconds heartbeat_interval, s
             break;
         }
 
-        // Sleep in short slices so stop_flag is checked responsively instead
-        // of blocking the full interval in one call.
-        auto remaining = heartbeat_interval;
-        while (remaining.count() > 0 && !stop_flag.load(std::memory_order_relaxed)) {
-            const auto slice = std::min(remaining, std::chrono::milliseconds(50));
-            std::this_thread::sleep_for(slice);
-            remaining -= slice;
+        if (sleep_or_stop(stop_fd, heartbeat_interval)) {
+            break;
         }
     }
     ::close(fd);
 }
 
 struct NaiveThroughputResult {
-    size_t connection_count = 0;
     bool all_connected = false;
     double setup_seconds = 0.0;
     double cpu_percent = 0.0;
@@ -500,61 +483,55 @@ struct NaiveThroughputResult {
 NaiveThroughputResult run_naive_throughput_trial(size_t connection_count, std::chrono::milliseconds heartbeat_interval) {
     MultiFeedEchoPeer peer(0);
     const uint16_t port = peer.port();
-    // This thread, and every worker thread spawned below, would otherwise
-    // silently inherit main()'s single-CPU pin (see
-    // bench::reset_affinity_unpinned's doc comment) -- forcing potentially
-    // hundreds of worker threads plus the echo peer onto one core, which
-    // would partly measure thread-contention-on-one-core rather than the
-    // naive thread-per-connection architecture's real cost. A real
-    // deployment of this naive approach would use all available cores.
+    // Peer and workers reset affinity (see run_throughput_trial).
     std::thread peer_thread([&peer] {
         bench::reset_affinity_unpinned();
         peer.run();
     });
 
-    // unique_ptr so pointers into `states` stay valid even if the vector
-    // reallocates as more connections are pushed -- the naive_worker
-    // threads capture their NaiveWorkerState by reference.
+    // unique_ptr: workers hold references into `states`, which must not move.
     std::vector<std::unique_ptr<NaiveWorkerState>> states;
     std::vector<std::thread> workers;
     states.reserve(connection_count);
     workers.reserve(connection_count);
     std::atomic<bool> stop_flag{false};
+    const int stop_fd = ::eventfd(0, EFD_NONBLOCK);
 
     const int64_t setup_start = now_monotonic_ns();
     for (size_t i = 0; i < connection_count; ++i) {
         states.push_back(std::make_unique<NaiveWorkerState>());
         NaiveWorkerState& state = *states.back();
-        workers.emplace_back([port, heartbeat_interval, &stop_flag, &state] {
+        workers.emplace_back([port, heartbeat_interval, &stop_flag, stop_fd, &state] {
             bench::reset_affinity_unpinned();
-            naive_worker(port, heartbeat_interval, stop_flag, state);
+            naive_worker(port, heartbeat_interval, stop_flag, stop_fd, state);
         });
     }
+
+    const auto count_connected = [&states] {
+        return static_cast<size_t>(std::count_if(
+            states.begin(), states.end(),
+            [](const std::unique_ptr<NaiveWorkerState>& s) { return s->connected.load(std::memory_order_relaxed); }));
+    };
 
     bool all_connected = false;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (std::chrono::steady_clock::now() < deadline) {
-        const size_t connected = static_cast<size_t>(std::count_if(
-            states.begin(), states.end(),
-            [](const std::unique_ptr<NaiveWorkerState>& s) { return s->connected.load(std::memory_order_relaxed); }));
-        if (connected == connection_count) {
+        if (count_connected() == connection_count) {
             all_connected = true;
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     const int64_t setup_end = now_monotonic_ns();
+    std::this_thread::sleep_for(settle_for(heartbeat_interval));  // same settle as the epoll trial
 
-    // Sum per-thread CPU time across all N worker threads, not process-wide
-    // getrusage(RUSAGE_SELF, ...) -- same F8 reasoning as the epoll-based
-    // trial: the echo peer's own thread lives in this same process and must
-    // not be counted as the naive implementation's cost.
+    // Sum per-thread CPU over the N workers (excludes the echo peer).
     double cpu_before = 0.0;
     for (auto& w : workers) {
         cpu_before += thread_cpu_seconds(w.native_handle());
     }
     const int64_t window_start = now_monotonic_ns();
-    std::this_thread::sleep_for(std::chrono::seconds(2));  // steady-state measurement window
+    std::this_thread::sleep_for(window_for(heartbeat_interval));  // same window as the epoll trial
     double cpu_after = 0.0;
     for (auto& w : workers) {
         cpu_after += thread_cpu_seconds(w.native_handle());
@@ -566,32 +543,32 @@ NaiveThroughputResult run_naive_throughput_trial(size_t connection_count, std::c
     const int64_t rss = bench::current_rss_bytes();
 
     stop_flag.store(true, std::memory_order_relaxed);
+    const uint64_t one = 1;
+    [[maybe_unused]] ssize_t wake_rc = ::write(stop_fd, &one, sizeof(one));
     for (auto& w : workers) {
         if (w.joinable()) {
             w.join();
         }
     }
+    ::close(stop_fd);
     peer.stop();
     peer_thread.join();
 
+    const size_t final_connected = count_connected();
     if (!all_connected) {
-        const size_t final_connected = static_cast<size_t>(std::count_if(
-            states.begin(), states.end(),
-            [](const std::unique_ptr<NaiveWorkerState>& s) { return s->connected.load(std::memory_order_relaxed); }));
         std::cerr << "[throughput_bench] warning: naive baseline only got " << final_connected << "/" << connection_count
                    << " connections established within the timeout\n";
     }
 
     NaiveThroughputResult result;
-    result.connection_count = connection_count;
-    result.all_connected = all_connected;
+    result.all_connected = all_connected && final_connected == connection_count;
     result.setup_seconds = static_cast<double>(setup_end - setup_start) / 1e9;
     result.cpu_percent = cpu_percent;
     result.rss_bytes = rss;
     return result;
 }
 
-void run_and_print_naive_repeated(size_t connection_count, std::chrono::milliseconds heartbeat_interval,
+bool run_and_print_naive_repeated(size_t connection_count, std::chrono::milliseconds heartbeat_interval,
                                    size_t repetitions) {
     const auto results =
         bench::repeat_trials([&]() { return run_naive_throughput_trial(connection_count, heartbeat_interval); }, repetitions);
@@ -604,33 +581,21 @@ void run_and_print_naive_repeated(size_t connection_count, std::chrono::millisec
 
     std::cout << "N=" << connection_count << "  (1 thread/connection)  hb_interval=" << heartbeat_interval.count()
               << "ms  (" << repetitions << " repetitions)" << (all_connected ? "" : "  [INCOMPLETE on some repetition]")
-              << "\n"
-              << "  setup:      min=" << setup.min << "s  median=" << setup.median << "s  max=" << setup.max << "s\n"
-              << "  steady_cpu: min=" << cpu.min << "%  median=" << cpu.median << "%  max=" << cpu.max << "%\n"
-              << "  rss:        min=" << (rss.min / (1024 * 1024)) << "MB  median=" << (rss.median / (1024 * 1024))
-              << "MB  max=" << (rss.max / (1024 * 1024)) << "MB\n";
+              << "\n";
+    print_setup_cpu_rss(setup, cpu, rss);
+    return all_connected;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     raise_fd_limit();
-    bench::try_pin_and_prioritize(0);
+    // No bench::try_pin_and_prioritize(): reactor, peer and naive workers must
+    // run on all permitted CPUs under the normal scheduler.
 
-    // --naive/--naive-only can appear anywhere on the command line; strip
-    // them out first so the remaining positional args (counts,
-    // heartbeat_interval, repetitions) keep their usual meaning regardless
-    // of where the flags were placed.
-    //
-    // --naive-only exists specifically so RSS numbers are trustworthy: RSS
-    // is an absolute snapshot (unlike CPU%, which is a before/after delta
-    // within its own window and so immune to this), and glibc's allocator
-    // doesn't return freed memory to the OS after a large trial finishes --
-    // running --naive in the same process as the epoll section left every
-    // naive-section RSS reading inflated by the epoll section's high-water
-    // mark (confirmed: N=10 read 72MB combined vs. 4.7MB run standalone).
-    // --naive-only skips the epoll section entirely so the naive baseline's
-    // RSS reflects only its own allocations.
+    // Flags may appear anywhere; strip them so the positionals keep their meaning.
+    // --naive-only exists for RSS: glibc keeps the epoll section's high-water
+    // heap, which would inflate a naive reading in the same process.
     bool naive_mode = false;
     bool naive_only = false;
     std::vector<std::string> positional;
@@ -646,66 +611,80 @@ int main(int argc, char** argv) {
         }
     }
 
+    const auto usage = [&] {
+        std::cerr << "usage: " << argv[0]
+                  << " [--naive|--naive-only] [counts_csv [heartbeat_interval_ms [repetitions]]]  (all positive integers)\n";
+        return 2;
+    };
+    if (positional.size() > 3) return usage();
+
     std::vector<size_t> counts = {10, 100, 500, 1000};
     if (!positional.empty()) {
         counts.clear();
         const std::string& arg = positional[0];
         size_t pos = 0;
-        while (pos < arg.size()) {
+        while (pos <= arg.size()) {
             const size_t comma = arg.find(',', pos);
-            counts.push_back(static_cast<size_t>(std::stoul(arg.substr(pos, comma - pos))));
+            const std::string token = arg.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            size_t n = 0;
+            if (!bench::parse_positive_size(token.c_str(), n)) {
+                std::cerr << "invalid connection count '" << token << "'\n";
+                return usage();
+            }
+            counts.push_back(n);
             if (comma == std::string::npos) break;
             pos = comma + 1;
         }
     }
 
-    // Defaults to config.h's own shipped defaults (1000ms interval, 3000ms
-    // timeout) rather than an ad-hoc 5x-more-aggressive cadence: the old
-    // 200ms/2000ms trial config made every reported CPU% roughly 5x what a
-    // default-config deployment would show at the same connection count,
-    // with nothing in the output saying so (PROJECT_PLAN.md F9). Overridable
-    // via the second positional arg for deliberately exploring other cadences.
+    // Default to the shipped config (1000ms interval, 3x timeout) so CPU% is
+    // what a default deployment would see.
     std::chrono::milliseconds heartbeat_interval{1000};
-    const bool interval_overridden = positional.size() > 1;
-    if (interval_overridden) {
-        heartbeat_interval = std::chrono::milliseconds(std::atoll(positional[1].c_str()));
+    bool interval_overridden = false;
+    if (positional.size() > 1) {
+        size_t ms = 0;
+        if (!bench::parse_positive_size(positional[1].c_str(), ms) || ms > 3'600'000) return usage();
+        interval_overridden = static_cast<int64_t>(ms) != heartbeat_interval.count();
+        heartbeat_interval = std::chrono::milliseconds(static_cast<int64_t>(ms));
     }
     const std::chrono::milliseconds heartbeat_timeout = heartbeat_interval * 3;
 
     size_t repetitions = 3;
-    if (positional.size() > 2) {
-        repetitions = static_cast<size_t>(std::atoll(positional[2].c_str()));
-    }
+    if (positional.size() > 2 && !bench::parse_positive_size(positional[2].c_str(), repetitions)) return usage();
 
     std::cout << "Low-Latency TCP Heartbeat Monitor -- throughput_bench\n"
               << "heartbeat_interval=" << heartbeat_interval.count()
               << "ms heartbeat_timeout=" << heartbeat_timeout.count() << "ms ("
               << (interval_overridden ? "overridden via CLI" : "shipped default, see config.h") << ")  repetitions="
-              << repetitions << "\n\n";
+              << repetitions << "\n"
+              << "steady_window=" << window_for(heartbeat_interval).count() << "ms ("
+              << (window_for(heartbeat_interval) / heartbeat_interval) << " heartbeat periods, after a "
+              << settle_for(heartbeat_interval).count() << "ms settle)\n\n";
 
+    bool all_complete = true;
     if (!naive_only) {
         std::cout << "=== connection count ramp (epoll_max_events=256) ===\n";
         for (const size_t n : counts) {
-            run_and_print_repeated(n, 256, heartbeat_interval, heartbeat_timeout, repetitions);
+            all_complete &= run_and_print_repeated(n, 256, heartbeat_interval, heartbeat_timeout, repetitions);
         }
 
         std::cout << "\n=== epoll_max_events batch size (N=" << counts.back() << ") ===\n";
         for (const int batch : {16, 64, 256, 1024}) {
-            run_and_print_repeated(counts.back(), batch, heartbeat_interval, heartbeat_timeout, repetitions);
+            all_complete &= run_and_print_repeated(counts.back(), batch, heartbeat_interval, heartbeat_timeout, repetitions);
         }
     }
 
     if (naive_mode) {
-        // PROJECT_PLAN.md section 12's other explicit ask: the epoll vs.
-        // naive-blocking-I/O comparison the original spec called for, which
-        // had been scoped out at build time. Reuses the same connection
-        // counts and cadence as the epoll run above, so the two sections are
-        // directly comparable line by line.
+        // Same counts and cadence as the epoll section, for a line-by-line comparison.
         std::cout << "\n=== naive blocking-thread-per-connection baseline (same N, same cadence) ===\n";
         for (const size_t n : counts) {
-            run_and_print_naive_repeated(n, heartbeat_interval, repetitions);
+            all_complete &= run_and_print_naive_repeated(n, heartbeat_interval, repetitions);
         }
     }
 
+    if (!all_complete) {
+        std::cerr << "[throughput_bench] FAILED: at least one trial did not bring every connection to HEALTHY/connected.\n";
+        return 1;
+    }
     return 0;
 }

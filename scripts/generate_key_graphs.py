@@ -1,28 +1,18 @@
 #!/usr/bin/env python3
-"""Renders the two graphs that most directly support this project's core
-claims: that the epoll reactor scales where a thread-per-connection design
-doesn't, and that the heartbeat round trip is genuinely low-latency.
+"""Renders the two benchmark charts (epoll vs thread-per-connection CPU, and
+heartbeat latency percentiles) from the saved output in bench/results/.
+Nothing is hardcoded: run parameters in captions come from the results files'
+headers, and durations are unit-parsed.
 
-Unlike an earlier version of this script, the numbers are NOT hardcoded here.
-They're parsed straight out of the saved benchmark output in bench/results/,
-so there's no manual transcription step to go stale -- refreshing the charts
-is "re-run the benchmarks, re-run this script," not "re-run the benchmarks,
-read the numbers, hand-edit some constants" (see scripts/run_benchmarks_and_plot.sh
-for the full, one-shot version of that first step).
-
-Usage:
-    python3 scripts/generate_key_graphs.py
-    # reads:
-    #   bench/results/latency_bench.txt
-    #   bench/results/throughput_bench_epoll.txt
-    #   bench/results/throughput_bench_naive.txt
-    # writes:
-    #   bench/charts/throughput_scalability.png
-    #   bench/charts/latency_percentiles.png
+Usage: python3 scripts/generate_key_graphs.py [--results-dir DIR] [--out-dir DIR]
+  reads  latency_bench.txt, throughput_bench_epoll.txt, throughput_bench_naive.txt
+  writes throughput_scalability.png, latency_percentiles.png
+(defaults: bench/results -> bench/charts; scripts/run_benchmarks_and_plot.sh runs both steps)
 """
 
 from __future__ import annotations
 
+import argparse
 import pathlib
 import re
 
@@ -33,10 +23,7 @@ import numpy as np
 
 matplotlib.use("Agg")
 
-# --- Palette -----------------------------------------------------------
-# Fixed categorical order (never reassigned per-chart): slot 1 = blue,
-# slot 2 = green. Both graphs use the same two entities in the same order
-# so color means the same thing across the whole pair.
+# --- Palette: series 1 = blue, series 2 = green, in the same order on both charts. ---
 SURFACE = "#fcfcfb"
 INK_PRIMARY = "#0b0b0b"
 INK_SECONDARY = "#52514e"
@@ -47,15 +34,14 @@ BASELINE = "#c3c2b7"
 SERIES_1 = "#2a78d6"  # epoll reactor / tcp_nodelay=true
 SERIES_2 = "#008300"  # naive thread-per-connection / tcp_nodelay=false
 
-# matplotlib's font manager resolves real installed font names, not CSS
-# aliases like "system-ui" -- DejaVu Sans ships with matplotlib itself, so
-# this renders identically regardless of what's installed on the machine,
-# with no fallback-chain warnings for names that aren't actually present.
+# DejaVu Sans ships with matplotlib, so charts render the same on any machine.
 SANS = ["DejaVu Sans"]
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent
 RESULTS_DIR = ROOT_DIR / "bench" / "results"
 OUT_DIR = ROOT_DIR / "bench" / "charts"
+
+_UNIT_TO_US = {"ns": 1e-3, "us": 1.0, "ms": 1e3, "s": 1e6}
 
 
 def _base_style() -> None:
@@ -75,8 +61,7 @@ def _base_style() -> None:
 
 
 def _strip_chrome(ax: plt.Axes) -> None:
-    """Recessive grid, no top/right spines, thin baseline -- the chart earns
-    attention through the data marks, not through frame decoration."""
+    """Recessive grid, no top/right/left spines, thin baseline."""
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
     ax.spines["bottom"].set_color(BASELINE)
@@ -100,35 +85,72 @@ def _require_text(path: pathlib.Path) -> str:
     return path.read_text()
 
 
-def parse_latency_results(text: str) -> dict[str, list[float]]:
-    """{"true": [p50, p90, p99], "false": [p50, p90, p99]} in microseconds --
-    the median of each percentile's reported min/median/max spread, from
-    `./bin/latency_bench`'s own stdout."""
-    result: dict[str, list[float]] = {}
+def parse_duration_us(token: str) -> float:
+    """'6.12us' / '850.00ns' / '1.09ms' / '2.30s' -> microseconds."""
+    m = re.fullmatch(r"([\d.]+)(ns|us|ms|s)", token.strip())
+    if not m:
+        raise SystemExit(f"cannot parse duration {token!r} (expected <number>ns|us|ms|s)")
+    return float(m.group(1)) * _UNIT_TO_US[m.group(2)]
+
+
+LATENCY_METRICS = ["p50", "p90", "p99", "p99.9", "max"]
+
+
+def parse_latency_results(text: str) -> dict:
+    """{"params": {"warmup", "measured", "repetitions"},
+        "true"/"false": {metric: {"min": us, "median": us, "max": us}}}
+    parsed from latency_bench's stdout (durations converted to microseconds)."""
+    hdr = re.search(r"warmup=(\d+)\s+measured=(\d+)\s+repetitions=(\d+)", text)
+    if not hdr:
+        raise SystemExit("latency_bench.txt has no 'warmup=.. measured=.. repetitions=..' header line")
+    params = {"warmup": int(hdr.group(1)), "measured": int(hdr.group(2)), "repetitions": int(hdr.group(3))}
+
+    result: dict = {"params": params}
     current: str | None = None
     for line in text.splitlines():
-        header = re.match(r"tcp_nodelay=(true|false)\s+across \d+ repetitions:", line.strip())
+        header = re.match(r"tcp_nodelay=(true|false)\s+across \d+ repetitions", line.strip())
         if header:
             current = header.group(1)
-            result[current] = []
+            result[current] = {}
             continue
         if current is not None:
-            m = re.search(r"p\d+:\s+min=[\d.]+us\s+median=([\d.]+)us", line)
+            m = re.match(
+                r"\s*(p50|p90|p99\.9|p99|max)\s*:\s+min=(\S+)\s+median=(\S+)\s+max=(\S+)",
+                line,
+            )
             if m:
-                result[current].append(float(m.group(1)))
-    if set(result) != {"true", "false"} or any(len(v) != 3 for v in result.values()):
-        raise SystemExit(
-            "could not parse latency_bench.txt into two configs x three percentiles -- "
-            "was the file truncated, or does the output format no longer match?"
-        )
+                result[current][m.group(1)] = {
+                    "min": parse_duration_us(m.group(2)),
+                    "median": parse_duration_us(m.group(3)),
+                    "max": parse_duration_us(m.group(4)),
+                }
+    for cfg in ("true", "false"):
+        got = result.get(cfg, {})
+        if not {"p50", "p90", "p99"} <= set(got):
+            raise SystemExit(
+                f"could not parse p50/p90/p99 for tcp_nodelay={cfg} out of latency_bench.txt -- "
+                "was the file truncated, or does the output format no longer match?"
+            )
     return result
 
 
+def parse_throughput_header(text: str) -> dict:
+    """{"interval_ms": int, "repetitions": int, "window_ms": int | None} from
+    a throughput_bench results header (window is absent in pre-window files)."""
+    hdr = re.search(r"heartbeat_interval=(\d+)ms.*?repetitions=(\d+)", text)
+    if not hdr:
+        raise SystemExit("throughput results file has no 'heartbeat_interval=..ms .. repetitions=..' header line")
+    win = re.search(r"steady_window=(\d+)ms", text)
+    return {
+        "interval_ms": int(hdr.group(1)),
+        "repetitions": int(hdr.group(2)),
+        "window_ms": int(win.group(1)) if win else None,
+    }
+
+
 def parse_throughput_epoll_ramp(text: str) -> dict[int, float]:
-    """{connection_count: steady_cpu_median_pct}, from the 'connection count
-    ramp' section only. The epoll_max_events batch-size sweep further down
-    the same file reuses N=5000 with different results and must not bleed
-    into this -- the text is truncated at that section's header first."""
+    """{connection_count: steady_cpu_median_pct} from the connection-count ramp
+    only; the epoll_max_events sweep below it reuses the largest N and is cut off."""
     ramp_section = text.split("=== epoll_max_events batch size", 1)[0]
     results: dict[int, float] = {}
     for block in re.finditer(
@@ -162,9 +184,18 @@ def parse_throughput_naive(text: str) -> dict[int, float]:
 # --- Graph 1: throughput scalability ------------------------------------
 
 
-def plot_throughput_scalability() -> pathlib.Path:
-    epoll = parse_throughput_epoll_ramp(_require_text(RESULTS_DIR / "throughput_bench_epoll.txt"))
-    naive = parse_throughput_naive(_require_text(RESULTS_DIR / "throughput_bench_naive.txt"))
+def plot_throughput_scalability() -> pathlib.Path:  # noqa: C901
+    epoll_text = _require_text(RESULTS_DIR / "throughput_bench_epoll.txt")
+    naive_text = _require_text(RESULTS_DIR / "throughput_bench_naive.txt")
+    epoll = parse_throughput_epoll_ramp(epoll_text)
+    naive = parse_throughput_naive(naive_text)
+    hdr = parse_throughput_header(epoll_text)
+    naive_hdr = parse_throughput_header(naive_text)
+    if (hdr["interval_ms"], hdr["window_ms"]) != (naive_hdr["interval_ms"], naive_hdr["window_ms"]):
+        raise SystemExit(
+            "epoll and naive results were produced with different heartbeat interval/window "
+            f"({hdr} vs {naive_hdr}) -- the comparison would be apples to oranges; re-run both."
+        )
 
     connection_counts = sorted(set(epoll) & set(naive))
     if not connection_counts:
@@ -209,12 +240,11 @@ def plot_throughput_scalability() -> pathlib.Path:
         label="naive thread-per-connection",
     )
 
-    # Direct end labels at the last point only -- selective, not a number
-    # crowding every marker.
+    # Label only the last point of each line.
     ax.annotate(
         f"{epoll_cpu_pct[-1]:.1f}%",
         (x[-1], epoll_cpu_pct[-1]),
-        xytext=(10, 4),
+        xytext=(10, 8 if epoll_cpu_pct[-1] >= naive_cpu_pct[-1] else -14),
         textcoords="offset points",
         color=SERIES_1,
         fontsize=11,
@@ -223,7 +253,7 @@ def plot_throughput_scalability() -> pathlib.Path:
     ax.annotate(
         f"{naive_cpu_pct[-1]:.1f}%",
         (x[-1], naive_cpu_pct[-1]),
-        xytext=(10, -2),
+        xytext=(10, -14 if epoll_cpu_pct[-1] >= naive_cpu_pct[-1] else 8),
         textcoords="offset points",
         color=SERIES_2,
         fontsize=11,
@@ -240,7 +270,7 @@ def plot_throughput_scalability() -> pathlib.Path:
     fig.text(
         0.08,
         0.955,
-        "The epoll reactor scales; a thread per connection doesn't",
+        "Epoll reactor vs thread-per-connection: steady-state CPU",
         fontsize=17,
         fontweight="bold",
         color=INK_PRIMARY,
@@ -248,7 +278,7 @@ def plot_throughput_scalability() -> pathlib.Path:
     fig.text(
         0.08,
         0.905,
-        "Steady-state CPU at the same connection count and heartbeat cadence (1000ms)",
+        f"Steady-state CPU at the same connection count and heartbeat cadence ({hdr['interval_ms']}ms)",
         fontsize=11.5,
         color=INK_SECONDARY,
     )
@@ -267,7 +297,9 @@ def plot_throughput_scalability() -> pathlib.Path:
         0.08,
         0.02,
         "Source: bench/results/throughput_bench_epoll.txt, throughput_bench_naive.txt "
-        "(median of 3 reps per point).\nSee PROJECT_PLAN.md §19 for this sandbox's run-to-run variance on absolute CPU%.",
+        f"(median of {hdr['repetitions']} reps per point"
+        + (f", {hdr['window_ms'] / 1000:g}s steady-state window" if hdr["window_ms"] else "")
+        + ").\nSingle machine, loopback, echo peer in the same process: read as relative, not absolute.",
         fontsize=8.5,
         color=INK_MUTED,
         linespacing=1.6,
@@ -285,87 +317,77 @@ def plot_throughput_scalability() -> pathlib.Path:
 
 def plot_latency_percentiles() -> pathlib.Path:
     latency = parse_latency_results(_require_text(RESULTS_DIR / "latency_bench.txt"))
-    percentiles = ["p50", "p90", "p99"]
-    nodelay_true_us = latency["true"]
-    nodelay_false_us = latency["false"]
+    params = latency["params"]
+    # Plot every percentile the file contains, in order.
+    metrics = [m for m in LATENCY_METRICS if m in latency["true"] and m in latency["false"]]
+    med_true = [latency["true"][m]["median"] for m in metrics]
+    med_false = [latency["false"][m]["median"] for m in metrics]
+    worst_true = [latency["true"][m]["max"] for m in metrics]
+    worst_false = [latency["false"][m]["max"] for m in metrics]
 
-    fig, ax = plt.subplots(figsize=(8.6, 6.2), dpi=200)
+    fig, ax = plt.subplots(figsize=(9.6, 6.4), dpi=200)
     _strip_chrome(ax)
 
-    x = np.arange(len(percentiles))
-    width = 0.32
+    x = np.arange(len(metrics))
+    width = 0.34
 
-    bars_true = ax.bar(
-        x - width / 2,
-        nodelay_true_us,
-        width,
-        color=SERIES_1,
-        label="tcp_nodelay = true",
-        zorder=3,
-    )
-    bars_false = ax.bar(
-        x + width / 2,
-        nodelay_false_us,
-        width,
-        color=SERIES_2,
-        label="tcp_nodelay = false",
-        zorder=3,
-    )
+    bars_true = ax.bar(x - width / 2, med_true, width, color=SERIES_1, label="tcp_nodelay = true (median of reps)", zorder=3)
+    bars_false = ax.bar(x + width / 2, med_false, width, color=SERIES_2, label="tcp_nodelay = false (median of reps)", zorder=3)
 
-    for bars in (bars_true, bars_false):
-        for rect in bars:
-            height = rect.get_height()
-            ax.annotate(
-                f"{height:.2f}µs",
-                (rect.get_x() + rect.get_width() / 2, height),
-                xytext=(0, 5),
-                textcoords="offset points",
-                ha="center",
-                fontsize=10,
-                color=INK_SECONDARY,
-                fontweight="normal",
-            )
+    # Worst repetition for each metric: the number a median-of-reps bar hides.
+    ax.scatter(x - width / 2, worst_true, marker="v", s=46, color=INK_PRIMARY, zorder=4, label="worst repetition")
+    ax.scatter(x + width / 2, worst_false, marker="v", s=46, color=INK_PRIMARY, zorder=4)
 
+    def fmt(us: float) -> str:
+        return f"{us / 1000:.2f}ms" if us >= 1000 else f"{us:.2f}\u00b5s"
+
+    # Median inside the bar, worst repetition above its marker; rotated to avoid collisions.
+    floor = min(med_true + med_false) / 12
+    for bars, worst in ((bars_true, worst_true), (bars_false, worst_false)):
+        for rect, w in zip(bars, worst):
+            cx = rect.get_x() + rect.get_width() / 2
+            ax.text(cx, floor * 1.15, fmt(rect.get_height()), rotation=90, ha="center", va="bottom",
+                    fontsize=8.5, color="white", fontweight="bold", zorder=5)
+            top = max(rect.get_height(), w)
+            ax.annotate(fmt(w), (cx, top), xytext=(0, 9), textcoords="offset points", rotation=90,
+                        ha="center", va="bottom", fontsize=8.5, color=INK_SECONDARY)
+
+    ax.set_yscale("log")
+    ax.set_ylim(floor, max(worst_true + worst_false) * 8)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: fmt(v)))
     ax.set_xticks(x)
-    ax.set_xticklabels(percentiles)
-    ax.set_ylabel("PING → PONG round-trip latency (µs)", fontsize=11)
-    ax.set_ylim(0, max(nodelay_true_us + nodelay_false_us) * 1.22)
+    ax.set_xticklabels(metrics)
+    ax.set_ylabel("PING \u2192 PONG round-trip latency (log scale)", fontsize=11)
 
-    fig.text(
-        0.1,
-        0.955,
-        "The heartbeat round trip stays single-digit microseconds",
-        fontsize=16,
-        fontweight="bold",
-        color=INK_PRIMARY,
-    )
+    fig.text(0.1, 0.955, "Heartbeat round trip: typical case and worst case", fontsize=16, fontweight="bold", color=INK_PRIMARY)
     fig.text(
         0.1,
         0.905,
-        "20,000 measured round trips × 5 repetitions per config, real sockets, loopback",
+        f"{params['measured']:,} measured round trips \u00d7 {params['repetitions']} repetitions per config "
+        f"({params['warmup']:,} warmup), real sockets, loopback",
         fontsize=11.5,
         color=INK_SECONDARY,
     )
 
-    legend = ax.legend(
-        loc="upper left",
-        frameon=False,
-        fontsize=10.5,
-        handlelength=1.6,
-        borderaxespad=0,
-    )
+    legend = ax.legend(loc="upper left", frameon=False, fontsize=10, handlelength=1.6, borderaxespad=0)
     for text in legend.get_texts():
         text.set_color(INK_SECONDARY)
 
+    tail_note = (
+        "Bars (value inside): median across repetitions. Markers (value above): worst repetition,\nso the tail is not hidden by the median."
+        if "p99.9" in metrics
+        else "Bars: median across repetitions (this results file predates p99.9/max reporting -- re-run the benchmark)."
+    )
     fig.text(
         0.1,
         0.02,
-        "Source: bench/results/latency_bench.txt, median across 5 alternating-order repetitions.",
+        f"Source: bench/results/latency_bench.txt, {params['repetitions']} alternating-order repetitions.\n{tail_note}",
         fontsize=8.5,
         color=INK_MUTED,
+        linespacing=1.6,
     )
 
-    fig.subplots_adjust(left=0.11, right=0.96, top=0.80, bottom=0.13)
+    fig.subplots_adjust(left=0.11, right=0.96, top=0.80, bottom=0.14)
     out_path = OUT_DIR / "latency_percentiles.png"
     fig.savefig(out_path)
     plt.close(fig)
@@ -373,6 +395,13 @@ def plot_latency_percentiles() -> pathlib.Path:
 
 
 def main() -> None:
+    global RESULTS_DIR, OUT_DIR
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--results-dir", type=pathlib.Path, default=RESULTS_DIR)
+    ap.add_argument("--out-dir", type=pathlib.Path, default=OUT_DIR)
+    args = ap.parse_args()
+    RESULTS_DIR, OUT_DIR = args.results_dir.resolve(), args.out_dir.resolve()
+
     _base_style()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     paths = [plot_throughput_scalability(), plot_latency_percentiles()]

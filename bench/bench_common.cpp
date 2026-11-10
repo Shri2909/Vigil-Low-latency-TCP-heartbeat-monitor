@@ -1,8 +1,11 @@
 #include "bench_common.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 
 #include <sched.h>
@@ -33,12 +36,35 @@ void print_report(const std::string& label, const PercentileReport& r) {
               << "  p99.9=" << format_duration_ns(r.p999) << "  max=" << format_duration_ns(r.max) << "\n";
 }
 
+namespace {
+
+// Affinity mask before any pinning; captured on first use, which is
+// try_pin_and_prioritize() in main() before any thread is spawned.
+const cpu_set_t& original_affinity() {
+    static const cpu_set_t mask = [] {
+        cpu_set_t m;
+        CPU_ZERO(&m);
+        if (::sched_getaffinity(0, sizeof(m), &m) != 0) {
+            // Query failed: fall back to all online CPUs.
+            const long nprocs = ::sysconf(_SC_NPROCESSORS_ONLN);
+            for (long i = 0; i < nprocs && i < CPU_SETSIZE; ++i) {
+                CPU_SET(static_cast<int>(i), &m);
+            }
+        }
+        return m;
+    }();
+    return mask;
+}
+
+}  // namespace
+
 void try_pin_and_prioritize(int cpu_id) {
+    const cpu_set_t& original = original_affinity();  // must capture before narrowing
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(cpu_id, &cpuset);
-    if (::sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0) {
-        std::cerr << "[bench] note: sched_setaffinity failed (not fatal) -- numbers may be noisier\n";
+    if (!CPU_ISSET(cpu_id, &original) || ::sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0) {
+        std::cerr << "[bench] note: could not pin to cpu " << cpu_id << " (not fatal) -- numbers may be noisier\n";
     }
 
     sched_param param{};
@@ -50,16 +76,30 @@ void try_pin_and_prioritize(int cpu_id) {
 }
 
 void reset_affinity_unpinned() {
-    const long nprocs = ::sysconf(_SC_NPROCESSORS_ONLN);
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    for (long i = 0; i < nprocs; ++i) {
-        CPU_SET(static_cast<int>(i), &cpuset);
+    // Best-effort: on failure the thread just keeps its inherited settings.
+    const sched_param param{};  // priority 0 is the only valid value for SCHED_OTHER
+    ::sched_setscheduler(0, SCHED_OTHER, &param);
+    const cpu_set_t& original = original_affinity();
+    ::sched_setaffinity(0, sizeof(original), &original);
+}
+
+bool parse_positive_size(const char* text, size_t& out) {
+    if (text == nullptr || *text == '\0') {
+        return false;
     }
-    // Best-effort, same as try_pin_and_prioritize -- a failure here just
-    // means this thread stays on whatever mask it inherited, not a fatal
-    // benchmark error.
-    ::sched_setaffinity(0, sizeof(cpuset), &cpuset);
+    // strtoull accepts leading whitespace and '-' (wrapping); require a digit first.
+    if (*text < '0' || *text > '9') {
+        return false;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || v == 0 ||
+        v > static_cast<unsigned long long>(std::numeric_limits<size_t>::max())) {
+        return false;
+    }
+    out = static_cast<size_t>(v);
+    return true;
 }
 
 int64_t current_rss_bytes() {
