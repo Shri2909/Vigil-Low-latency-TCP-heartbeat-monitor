@@ -43,8 +43,10 @@ public:
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
         addr.sin_port = htons(port);
-        ::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-        ::listen(listen_fd_, SOMAXCONN);
+        if (listen_fd_ >= 0) {
+            [[maybe_unused]] const int bind_rc = ::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+            [[maybe_unused]] const int listen_rc = ::listen(listen_fd_, SOMAXCONN);
+        }
         sockaddr_in bound{};
         socklen_t len = sizeof(bound);
         ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&bound), &len);

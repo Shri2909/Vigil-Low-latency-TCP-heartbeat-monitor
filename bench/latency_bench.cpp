@@ -52,7 +52,10 @@ TrialResult run_latency_trial(bool tcp_nodelay, size_t warmup_iters, size_t meas
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(port);
-    ::connect(client_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    // Non-blocking connect: EINPROGRESS is expected; completion shows up as EPOLLOUT.
+    if (client_fd >= 0) {
+        [[maybe_unused]] const int connect_rc = ::connect(client_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    }
 
     Connection conn(client_fd, Role::kInitiator, /*feed_id=*/1, "127.0.0.1", port, config);
 
@@ -126,22 +129,6 @@ TrialResult run_latency_trial(bool tcp_nodelay, size_t warmup_iters, size_t meas
     return result;
 }
 
-// min/median/max of each percentile across repetitions. Output format is
-// parsed by scripts/generate_key_graphs.py.
-void print_spread_report(const std::string& label, const std::vector<bench::PercentileReport>& reports) {
-    const auto line = [&](const char* name, auto extract) {
-        const auto sp = bench::summarize_spread(reports, extract);
-        std::cout << "  " << name << ": min=" << format_duration_ns(sp.min) << " median=" << format_duration_ns(sp.median)
-                  << " max=" << format_duration_ns(sp.max) << "\n";
-    };
-    std::cout << label << " across " << reports.size() << " repetitions (the 'max' of each row is the worst repetition):\n";
-    line("p50  ", [](const bench::PercentileReport& r) { return r.p50; });
-    line("p90  ", [](const bench::PercentileReport& r) { return r.p90; });
-    line("p99  ", [](const bench::PercentileReport& r) { return r.p99; });
-    line("p99.9", [](const bench::PercentileReport& r) { return r.p999; });
-    line("max  ", [](const bench::PercentileReport& r) { return r.max; });
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -207,8 +194,8 @@ int main(int argc, char** argv) {
         reports_nodelay_false.push_back(p.nodelay_false);
     }
 
-    print_spread_report("tcp_nodelay=true ", reports_nodelay_true);
-    print_spread_report("tcp_nodelay=false", reports_nodelay_false);
+    bench::print_spread_report("tcp_nodelay=true ", reports_nodelay_true);
+    bench::print_spread_report("tcp_nodelay=false", reports_nodelay_false);
 
     return 0;
 }

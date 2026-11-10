@@ -36,6 +36,22 @@ void print_report(const std::string& label, const PercentileReport& r) {
               << "  p99.9=" << format_duration_ns(r.p999) << "  max=" << format_duration_ns(r.max) << "\n";
 }
 
+// min/median/max of each percentile across repetitions. Output format is
+// parsed by scripts/generate_key_graphs.py.
+void print_spread_report(const std::string& label, const std::vector<PercentileReport>& reports) {
+    const auto line = [&](const char* name, auto extract) {
+        const auto sp = summarize_spread(reports, extract);
+        std::cout << "  " << name << ": min=" << format_duration_ns(sp.min) << " median=" << format_duration_ns(sp.median)
+                  << " max=" << format_duration_ns(sp.max) << "\n";
+    };
+    std::cout << label << " across " << reports.size() << " repetitions (the 'max' of each row is the worst repetition):\n";
+    line("p50  ", [](const PercentileReport& r) { return r.p50; });
+    line("p90  ", [](const PercentileReport& r) { return r.p90; });
+    line("p99  ", [](const PercentileReport& r) { return r.p99; });
+    line("p99.9", [](const PercentileReport& r) { return r.p999; });
+    line("max  ", [](const PercentileReport& r) { return r.max; });
+}
+
 namespace {
 
 // Affinity mask before any pinning; captured on first use, which is

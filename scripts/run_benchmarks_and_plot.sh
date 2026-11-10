@@ -133,6 +133,12 @@ if [[ -n "${LAT_ISOLATED_CPUS}" ]]; then
 fi
 
 echo
+echo "=== running raw_socket_baseline (kernel-floor reference for the latency numbers) ==="
+T0="$(throttle_count)"
+run_pinned "${LAT_CPUS}" ./bin/raw_socket_baseline "${LAT_MEASURED}" "${LAT_WARMUP}" "${LAT_REPS}" | tee "${TMP_DIR}/raw_socket_baseline.txt"
+check_throttle "raw_socket_baseline" "${T0}"
+
+echo
 echo "=== running throughput_bench: epoll connection-count ramp + epoll_max_events sweep ==="
 nstat -n >/dev/null 2>&1 || true
 T0="$(throttle_count)"
@@ -181,6 +187,7 @@ echo
 echo "=== all steps succeeded -- replacing committed results and charts ==="
 mv -f "${TMP_DIR}"/latency_bench.txt "${TMP_DIR}"/throughput_bench_epoll.txt "${TMP_DIR}"/throughput_bench_naive.txt \
       "${TMP_DIR}"/environment_snapshot.txt "${RESULTS_DIR}/"
+mv -f "${TMP_DIR}/raw_socket_baseline.txt" "${RESULTS_DIR}/"
 if [[ -f "${TMP_DIR}/latency_bench_isolated.txt" ]]; then
     mv -f "${TMP_DIR}/latency_bench_isolated.txt" "${RESULTS_DIR}/"
 fi

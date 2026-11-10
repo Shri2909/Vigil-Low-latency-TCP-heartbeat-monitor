@@ -31,6 +31,10 @@ PercentileReport summarize(std::vector<int64_t> samples);
 
 void print_report(const std::string& label, const PercentileReport& report);
 
+// min/median/max of each percentile across repetitions. Output format is parsed
+// by scripts/generate_key_graphs.py.
+void print_spread_report(const std::string& label, const std::vector<PercentileReport>& reports);
+
 // Strict positive-integer parse: rejects empty, non-numeric, trailing garbage,
 // negatives, zero and overflow. Leaves `out` untouched on rejection.
 bool parse_positive_size(const char* text, size_t& out);
