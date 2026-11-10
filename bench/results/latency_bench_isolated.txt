@@ -1,0 +1,38 @@
+# env: 2026-11-10T13:35:22+05:30 kernel=7.0.0-42-generic governor=performance AC=1 taskset=4 cstates4,5=disabled cap_sys_nice=ep git=41ce3c2 cmdline_isol=4-5
+[bench] note: could not pin to cpu 0 (not fatal) -- numbers may be noisier
+Low-Latency TCP Heartbeat Monitor -- latency_bench
+warmup=500 measured=20000 repetitions=5 (loopback)
+
+rep 1 tcp_nodelay=true  (20000 samples)
+  min=12.96us  p50=13.23us  p90=13.47us  p99=15.38us  p99.9=21.77us  max=28.10us
+rep 1 tcp_nodelay=false (20000 samples)
+  min=11.20us  p50=13.12us  p90=13.38us  p99=14.87us  p99.9=18.22us  max=26.88us
+rep 2 tcp_nodelay=false (20000 samples)
+  min=12.94us  p50=13.17us  p90=13.43us  p99=15.13us  p99.9=19.92us  max=29.79us
+rep 2 tcp_nodelay=true  (20000 samples)
+  min=11.32us  p50=13.21us  p90=13.44us  p99=14.62us  p99.9=18.79us  max=31.39us
+rep 3 tcp_nodelay=true  (20000 samples)
+  min=11.31us  p50=13.13us  p90=13.34us  p99=14.68us  p99.9=17.37us  max=26.86us
+rep 3 tcp_nodelay=false (20000 samples)
+  min=11.21us  p50=13.09us  p90=13.29us  p99=14.38us  p99.9=17.08us  max=31.90us
+rep 4 tcp_nodelay=false (20000 samples)
+  min=11.31us  p50=13.13us  p90=13.33us  p99=14.39us  p99.9=17.18us  max=24.88us
+rep 4 tcp_nodelay=true  (20000 samples)
+  min=12.87us  p50=13.13us  p90=13.36us  p99=15.23us  p99.9=17.80us  max=26.57us
+rep 5 tcp_nodelay=true  (20000 samples)
+  min=12.91us  p50=13.15us  p90=13.39us  p99=15.11us  p99.9=17.19us  max=26.79us
+rep 5 tcp_nodelay=false (20000 samples)
+  min=12.91us  p50=13.15us  p90=13.40us  p99=15.34us  p99.9=18.07us  max=26.74us
+
+tcp_nodelay=true  across 5 repetitions (the 'max' of each row is the worst repetition):
+  p50  : min=13.13us median=13.15us max=13.23us
+  p90  : min=13.34us median=13.39us max=13.47us
+  p99  : min=14.62us median=15.11us max=15.38us
+  p99.9: min=17.19us median=17.80us max=21.77us
+  max  : min=26.57us median=26.86us max=31.39us
+tcp_nodelay=false across 5 repetitions (the 'max' of each row is the worst repetition):
+  p50  : min=13.09us median=13.13us max=13.17us
+  p90  : min=13.29us median=13.38us max=13.43us
+  p99  : min=14.38us median=14.87us max=15.34us
+  p99.9: min=17.08us median=18.07us max=19.92us
+  max  : min=24.88us median=26.88us max=31.90us

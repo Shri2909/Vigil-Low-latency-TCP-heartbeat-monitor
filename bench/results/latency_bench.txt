@@ -1,11 +1,36 @@
 Low-Latency TCP Heartbeat Monitor -- latency_bench
 warmup=500 measured=20000 repetitions=5 (loopback)
 
-tcp_nodelay=true  across 5 repetitions:
-  p50: min=6.11us median=6.12us max=6.22us
-  p90: min=6.40us median=6.64us max=6.91us
-  p99: min=7.24us median=7.52us max=9.87us
-tcp_nodelay=false across 5 repetitions:
-  p50: min=6.10us median=6.12us max=6.14us
-  p90: min=6.34us median=6.62us max=6.76us
-  p99: min=7.31us median=7.40us max=41.85us
+rep 1 tcp_nodelay=true  (20000 samples)
+  min=5.20us  p50=5.94us  p90=6.03us  p99=8.02us  p99.9=33.18us  max=155.29us
+rep 1 tcp_nodelay=false (20000 samples)
+  min=5.16us  p50=5.96us  p90=7.22us  p99=43.12us  p99.9=123.66us  max=179.85us
+rep 2 tcp_nodelay=false (20000 samples)
+  min=5.17us  p50=5.96us  p90=6.34us  p99=7.67us  p99.9=12.40us  max=112.13us
+rep 2 tcp_nodelay=true  (20000 samples)
+  min=5.17us  p50=6.41us  p90=7.06us  p99=8.38us  p99.9=12.81us  max=172.87us
+rep 3 tcp_nodelay=true  (20000 samples)
+  min=5.78us  p50=5.92us  p90=6.00us  p99=7.34us  p99.9=9.91us  max=122.41us
+rep 3 tcp_nodelay=false (20000 samples)
+  min=5.18us  p50=6.38us  p90=6.95us  p99=7.85us  p99.9=9.56us  max=40.70us
+rep 4 tcp_nodelay=false (20000 samples)
+  min=5.16us  p50=6.40us  p90=7.05us  p99=8.89us  p99.9=43.24us  max=189.77us
+rep 4 tcp_nodelay=true  (20000 samples)
+  min=5.16us  p50=6.39us  p90=6.95us  p99=8.42us  p99.9=18.51us  max=151.50us
+rep 5 tcp_nodelay=true  (20000 samples)
+  min=6.11us  p50=6.42us  p90=7.02us  p99=43.03us  p99.9=125.97us  max=203.11us
+rep 5 tcp_nodelay=false (20000 samples)
+  min=5.16us  p50=6.39us  p90=6.79us  p99=7.69us  p99.9=8.50us  max=23.07us
+
+tcp_nodelay=true  across 5 repetitions (the 'max' of each row is the worst repetition):
+  p50  : min=5.92us median=6.39us max=6.42us
+  p90  : min=6.00us median=6.95us max=7.06us
+  p99  : min=7.34us median=8.38us max=43.03us
+  p99.9: min=9.91us median=18.51us max=125.97us
+  max  : min=122.41us median=155.29us max=203.11us
+tcp_nodelay=false across 5 repetitions (the 'max' of each row is the worst repetition):
+  p50  : min=5.96us median=6.38us max=6.40us
+  p90  : min=6.34us median=6.95us max=7.22us
+  p99  : min=7.67us median=7.85us max=43.12us
+  p99.9: min=8.50us median=12.40us max=123.66us
+  max  : min=23.07us median=112.13us max=189.77us

@@ -1,0 +1,29 @@
+Benchmark environment for the committed results (captured 2026-11-10)
+=====================================================================
+Machine : 12th-gen Intel Core i5-1235U laptop (2 P-cores w/ SMT = CPUs 0-3, 8 E-cores = CPUs 4-11), 15 GB RAM
+Kernel  : 7.0.0-42-generic; cmdline isolcpus=4,5 nohz_full=4,5 rcu_nocbs=4,5
+Commit  : 41ce3c2 + working-tree changes (post-audit fixes); built with `make clean && make all && make bench` (-O2)
+Power   : AC connected; turbo enabled; SMT enabled; thermald + power-profiles-daemon running
+
+Tuning applied before the runs (all reverted by reboot)
+  * scaling_governor = performance on all CPUs
+  * cpuidle states 1-4 disabled on CPUs 4,5 (E-core latency run only; reverted afterwards)
+  * IRQ 40 (i2c touchpad) moved off CPUs 4,5; default_smp_affinity = fcf
+  * net.core.netdev_max_backlog = 16384
+  * bin/latency_bench given cap_sys_nice+ep (SCHED_FIFO for the client thread)
+  * background services stopped (apt-daily, sysstat-collect, unattended-upgrades, fwupd, cups, avahi, bluetooth, ModemManager)
+  * VS Code and Claude processes moved to CPUs 0-3 with taskset (VS Code stayed open but idle)
+
+Runs   (reproduce with scripts/run_benchmarks_and_plot.sh: LAT_ISOLATED_CPUS=4 THROUGHPUT_CPUS=6-9,11 REPS=5)
+  latency_bench.txt              : `./bin/latency_bench 20000 500 5` with NO taskset -> client pinned to CPU 0 (a P-core)
+                                   by the code, simulator thread floats. Re-run after a first attempt was discarded because
+                                   the package thermally throttled (throttle counter 119 -> 239). Clean run: counter 244 -> 244.
+  latency_bench_isolated.txt      : `taskset -c 4 ./bin/latency_bench 20000 500 5` -> client and simulator share isolated
+                                   E-core CPU 4 (same-core ping-pong), C-states disabled on 4,5. No throttle events.
+  throughput_bench_epoll.txt     : `taskset -c 6-9,11 ./bin/throughput_bench 10,100,1000,5000 1000 5`
+  throughput_bench_naive.txt     : `taskset -c 6-9,11 ./bin/throughput_bench --naive-only N 1000 5` for N in 10 100 1000 5000
+                                   (60 s pause between the epoll and naive suites). Both suites exit 0, no throttle events,
+                                   TcpRetransSegs 6 (epoll) / 1 (naive), no ListenOverflows/ListenDrops.
+
+Caveats: laptop under sustained load runs warm (package 61-78 C during the session); VS Code was open but idle;
+CPU frequency was not pinned or measured with turbostat. Treat absolute values as "this machine, this session".
