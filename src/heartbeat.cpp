@@ -1,15 +1,11 @@
 #include "heartbeat.h"
 
 #include <cstring>
-#include <endian.h>  // htobe16/32/64, be16/32/64toh -- glibc, Linux-only (matches project scope)
+#include <endian.h>
 
 namespace {
 
-// CRC32 (IEEE 802.3, polynomial 0xEDB88320) lookup table, generated at compile
-// time via constexpr rather than lazily built at runtime -- applying the
-// "compile-time computation" technique from PROJECT_PLAN.md section 15
-// (Bilokon & Gunduz section 3.1): the table exists before main() runs, at zero
-// runtime cost and with no static-initialization-order concern.
+// CRC32 (IEEE 802.3, polynomial 0xEDB88320) table, built at compile time.
 constexpr std::array<uint32_t, 256> make_crc32_table() {
     std::array<uint32_t, 256> table{};
     for (uint32_t i = 0; i < 256; ++i) {
@@ -64,9 +60,7 @@ void encode_heartbeat(const HeartbeatMessage& msg, HeartbeatWireBuffer& out) {
     std::memcpy(out.data() + offset, &sequence_be, sizeof(sequence_be));
     offset += sizeof(sequence_be);
 
-    // timestamp_ns is signed; reinterpret its bits as unsigned for the byte-order
-    // swap, then write those same bits back out. The value itself is never
-    // arithmetically touched, so this is lossless regardless of sign.
+    // Byte-swap the signed timestamp via its raw bits; the value is never touched arithmetically.
     uint64_t ts_bits;
     std::memcpy(&ts_bits, &msg.timestamp_ns, sizeof(ts_bits));
     const uint64_t ts_be = htobe64(ts_bits);

@@ -7,6 +7,7 @@
 #include <cstring>
 #include <iostream>
 #include <random>
+#include <sstream>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -67,14 +68,9 @@ std::optional<int> FeedMonitor::create_and_connect_socket(const std::string& hos
         return std::nullopt;
     }
 
-    // A non-blocking connect() may succeed immediately (rc==0, rare), report
-    // EINPROGRESS (the common case -- wait for EPOLLOUT), or fail immediately
-    // (e.g. ECONNREFUSED on loopback to a closed port -- very much a live
-    // case for this project). All three are handled uniformly: the fd stays
-    // valid either way, and Connection::on_writable's getsockopt(SO_ERROR)
-    // check discovers the outcome whether it happened synchronously or
-    // asynchronously, so no special-casing is needed here.
-    (void)::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    // Result deliberately ignored (EINPROGRESS, or an immediate ECONNREFUSED on
+    // loopback): Connection::on_writable's SO_ERROR check finds the outcome either way.
+    [[maybe_unused]] const int connect_rc = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
     return fd;
 }
 
@@ -102,6 +98,11 @@ bool FeedMonitor::add_feed(const FeedEndpoint& endpoint) {
     if (::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_ADD, fd, &ev) < 0) {
         std::cerr << "[feed_monitor] epoll_ctl(ADD) failed for feed " << endpoint.feed_id << ": "
                    << std::strerror(errno) << "\n";
+        // Undo the insertion; the Connection's destructor closes fd.
+        index_of_fd_.erase(fd);
+        index_of_feed_id_.erase(endpoint.feed_id);
+        slots_.pop_back();
+        return false;
     }
     return true;
 }
@@ -125,16 +126,8 @@ void FeedMonitor::remove_slot_at(size_t index) {
     const size_t last = slots_.size() - 1;
     if (index != last) {
         slots_[index] = std::move(slots_[last]);
-        // the moved-in slot's fd/feed_id now live at `index`, not `last` --
-        // both maps must be repointed or every subsequent lookup for that
-        // feed silently targets the wrong (now-erased) slot. But a kFailed
-        // connection's fd is open-but-deliberately-unmapped: on_connection_failed
-        // erases its index_of_fd_ entry the moment it fails, without closing the
-        // fd (that only happens later, via rebind()) -- so connection.fd() for a
-        // kFailed slot is still >= 0 even though it must NOT be in index_of_fd_.
-        // Repointing unconditionally here would silently re-insert the exact
-        // entry that erase was meant to remove, leaking it until that slot's next
-        // successful reconnect (or forever, if it has given up retrying).
+        // Repoint both maps at the moved-in slot. A kFailed slot is not in
+        // index_of_fd_ (on_connection_failed erased it), so don't re-insert it.
         const int moved_fd = slots_[index].connection.fd();
         if (moved_fd >= 0 && slots_[index].connection.state() != ConnectionState::kFailed) {
             index_of_fd_[moved_fd] = index;
@@ -164,18 +157,12 @@ void FeedMonitor::force_reconnect(uint32_t feed_id) {
     Slot& slot = slots_[it->second];
     if (slot.connection.state() == ConnectionState::kFailed) {
         slot.give_up = false;
-        // A manual "reconnect now" implies a full fresh retry budget, not
-        // "immediately re-trigger give_up on the very next failure" -- without
-        // this reset, forcing a reconnect on a slot that already exhausted
-        // max_reconnect_attempts would silently give up again after just one
-        // more failed attempt, defeating the operator's actual intent.
-        slot.reconnect_attempts = 0;
-        slot.reconnect_ready_at_ns = 0;  // ready immediately -- the next tick fires it
+        slot.reconnect_attempts = 0;     // fresh retry budget, or one more failure would give up again
+        slot.reconnect_ready_at_ns = 0;  // due now; the next tick fires it
     }
 }
 
 void FeedMonitor::run() {
-    stop_requested_.store(false, std::memory_order_relaxed);
     while (!stop_requested_.load(std::memory_order_relaxed)) {
         const int n = ::epoll_wait(epoll_fd_.get(), event_batch_.data(),
                                     static_cast<int>(event_batch_.size()), -1);
@@ -231,11 +218,8 @@ void FeedMonitor::handle_connection_event(size_t index, uint32_t events, int64_t
         ::getsockopt(conn.fd(), SOL_SOCKET, SO_ERROR, &err, &len);
         conn.on_hangup_or_error(now_ns, err != 0 ? err : ECONNRESET);
     } else {
-        // EPOLLOUT before EPOLLIN: for a kConnecting connection, EPOLLOUT is
-        // what signals connect() completion and must be processed first --
-        // on_readable() would be meaningless (or a wasted recv() call) before
-        // that transition happens, and both bits can legitimately be set in
-        // the same event on a fast loopback connection.
+        // EPOLLOUT first: it signals connect() completion, which must precede
+        // reading (both bits can arrive together on loopback).
         if (events & EPOLLOUT) {
             conn.on_writable(now_ns);
         }
@@ -255,21 +239,25 @@ void FeedMonitor::on_connection_failed(size_t index) {
     Slot& slot = slots_[index];
     const int fd = slot.connection.fd();
     if (fd >= 0) {
-        // Stop watching the dead fd immediately, rather than waiting for the
-        // eventual reconnect to close it via rebind(): under level-triggered
-        // epoll (edge_triggered=false), a HUP/ERR fd left registered would
-        // keep reporting ready on every epoll_wait call until acted on --
-        // effectively a busy-loop for however long the backoff delay is.
+        // Deregister before closing; a HUP/ERR fd left in a level-triggered set
+        // would busy-loop for the whole backoff delay.
         ::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_DEL, fd, nullptr);
         index_of_fd_.erase(fd);
+        slot.connection.close_fd();  // peer sees the close during backoff; rebind() installs a fresh fd
     }
     emit_failure_alert(slot);
     schedule_reconnect(index, now_monotonic_ns());
 }
 
 void FeedMonitor::emit_failure_alert(const Slot& slot) const {
-    std::cerr << "[feed_monitor] ALERT: feed " << slot.connection.feed_id() << " (\"" << slot.name
-               << "\" " << slot.connection.host() << ":" << slot.connection.port() << ") failed\n";
+    std::ostringstream msg;
+    msg << "feed " << slot.connection.feed_id() << " (\"" << slot.name << "\" " << slot.connection.host()
+        << ":" << slot.connection.port() << ") failed";
+    if (on_alert_) {
+        on_alert_(msg.str());
+        return;
+    }
+    std::cerr << "[feed_monitor] ALERT: " << msg.str() << "\n";
 }
 
 void FeedMonitor::schedule_reconnect(size_t index, int64_t now_ns) {
@@ -291,10 +279,8 @@ int64_t FeedMonitor::reconnect_delay_ns(int attempt) const {
     const int64_t max_delay =
         std::chrono::duration_cast<std::chrono::nanoseconds>(config_.reconnect_max_delay).count();
 
-    // Exponential backoff, capped, with +/-25% jitter so many simultaneously
-    // failing feeds don't all retry in lockstep (a thundering herd against
-    // whatever's on the other end).
-    const int capped_attempt = std::min(attempt, 30);  // avoid overflowing 2^attempt over a long-running process
+    // Exponential backoff, capped, with +/-25% jitter so failing feeds don't retry in lockstep.
+    const int capped_attempt = std::min(attempt, 30);  // avoid overflow
     int64_t delay = base;
     for (int i = 0; i < capped_attempt && delay < max_delay; ++i) {
         delay *= 2;
@@ -304,7 +290,8 @@ int64_t FeedMonitor::reconnect_delay_ns(int attempt) const {
     thread_local std::mt19937_64 rng{std::random_device{}()};
     std::uniform_real_distribution<double> jitter(-0.25, 0.25);
     const double factor = 1.0 + jitter(rng);
-    return static_cast<int64_t>(static_cast<double>(delay) * factor);
+    // Cap after jitter so the delay never exceeds max_delay.
+    return std::min(static_cast<int64_t>(static_cast<double>(delay) * factor), max_delay);
 }
 
 void FeedMonitor::initiate_connect(size_t index, int64_t now_ns) {
@@ -324,22 +311,31 @@ void FeedMonitor::initiate_connect(size_t index, int64_t now_ns) {
     ev.events = epoll_interest_flags(true, slot.connection.wants_write(), config_.edge_triggered);
     ev.data.fd = fd;
     if (::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_ADD, fd, &ev) < 0) {
+        const int err = errno;
         std::cerr << "[feed_monitor] epoll_ctl(ADD) failed on reconnect for feed "
-                   << slot.connection.feed_id() << ": " << std::strerror(errno) << "\n";
+                   << slot.connection.feed_id() << ": " << std::strerror(err) << "\n";
+        // Never registered, so no event will arrive; fail it now and back off.
+        slot.connection.on_hangup_or_error(now_ns, err);
+        on_connection_failed(index);
     }
 }
 
 void FeedMonitor::sync_epoll_interest(size_t index) {
     Connection& conn = slots_[index].connection;
+    if (conn.fd() < 0) {
+        return;  // closed by on_connection_failed(); nothing registered to update
+    }
     epoll_event ev{};
     ev.events = epoll_interest_flags(true, conn.wants_write(), config_.edge_triggered);
     ev.data.fd = conn.fd();
-    ::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_MOD, conn.fd(), &ev);
+    if (::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_MOD, conn.fd(), &ev) < 0) {
+        std::cerr << "[feed_monitor] epoll_ctl(MOD) failed for feed " << conn.feed_id() << ": "
+                   << std::strerror(errno) << "\n";
+    }
 }
 
 void FeedMonitor::on_timer_tick() {
-    // Drain the timerfd's expiration counter -- required even though the
-    // value itself isn't used, or epoll keeps reporting it readable.
+    // Drain the expiration counter or epoll keeps reporting the timerfd readable.
     uint64_t expirations;
     [[maybe_unused]] const ssize_t discard = ::read(timer_fd_.get(), &expirations, sizeof(expirations));
 
@@ -347,15 +343,31 @@ void FeedMonitor::on_timer_tick() {
     const int64_t interval_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(config_.heartbeat_interval).count();
 
+    // Backoff resets only after a connection stays healthy for one heartbeat_timeout,
+    // so a peer that handshakes then drops isn't retried at the base delay forever.
+    const int64_t stable_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(config_.heartbeat_timeout).count();
+
+    // Indices are stable here: on_connection_failed() never removes a slot.
     for (size_t i = 0; i < slots_.size(); ++i) {
         Slot& slot = slots_[i];
         const ConnectionState state = slot.connection.state();
+
+        if (state == ConnectionState::kHealthy && slot.reconnect_attempts > 0 &&
+            now_ns - slot.connection.stats().connected_since_ns >= stable_ns) {
+            slot.reconnect_attempts = 0;
+        }
 
         if (state == ConnectionState::kHealthy || state == ConnectionState::kDegraded) {
             if (now_ns >= slot.next_ping_due_ns) {
                 slot.connection.send_ping(now_ns);
                 slot.next_ping_due_ns = now_ns + interval_ns;
-                sync_epoll_interest(i);  // send_ping may have queued bytes -> needs EPOLLOUT armed
+                if (slot.connection.state() == ConnectionState::kFailed) {
+                    // The send itself failed; no epoll event will report it.
+                    on_connection_failed(i);
+                    continue;
+                }
+                sync_epoll_interest(i);  // send_ping may have queued bytes needing EPOLLOUT
             }
             if (slot.connection.check_timeout(now_ns)) {
                 on_connection_failed(i);
@@ -375,93 +387,135 @@ void FeedMonitor::on_timer_tick() {
     }
 }
 
+void FeedMonitor::dispatch_command_line(std::string line) {
+    if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+    }
+    if (on_command_line_) {
+        on_command_line_(line);
+    }
+}
+
 void FeedMonitor::on_command_fd_readable() {
-    char buf[1024];
+    // Bounds reads per wakeup so a fast producer can't starve the reactor; if
+    // the budget runs out, the fd is re-armed below instead of drained to EAGAIN.
+    constexpr int kMaxReadsPerWakeup = 16;
+    char buf[4096];
     bool eof = false;
-    while (true) {
+    bool drained = false;
+
+    for (int reads = 0; reads < kMaxReadsPerWakeup && !stop_requested_.load(std::memory_order_relaxed); ++reads) {
         const ssize_t n = ::read(command_fd_, buf, sizeof(buf));
         if (n > 0) {
             command_line_buffer_.append(buf, static_cast<size_t>(n));
-            if (command_line_buffer_.size() > kMaxCommandLineBufferBytes) {
+
+            // Dispatch complete lines now; only the unterminated remainder is length-capped.
+            size_t start = 0;
+            size_t pos;
+            while ((pos = command_line_buffer_.find('\n', start)) != std::string::npos) {
+                if (discarding_oversized_line_) {
+                    discarding_oversized_line_ = false;  // the over-long line finally ended
+                } else if (pos - start > kMaxCommandLineBufferBytes) {
+                    // Terminated, but already past the cap.
+                    std::cerr << "[feed_monitor] command line exceeded " << kMaxCommandLineBufferBytes
+                              << " bytes -- discarding it\n";
+                } else {
+                    dispatch_command_line(command_line_buffer_.substr(start, pos - start));
+                }
+                start = pos + 1;
+            }
+            command_line_buffer_.erase(0, start);
+
+            if (discarding_oversized_line_) {
+                command_line_buffer_.clear();  // still inside the line being dropped
+            } else if (command_line_buffer_.size() > kMaxCommandLineBufferBytes) {
                 std::cerr << "[feed_monitor] command line exceeded " << kMaxCommandLineBufferBytes
-                          << " bytes without a newline -- discarding buffered input\n";
+                          << " bytes without a newline -- discarding it\n";
                 command_line_buffer_.clear();
+                discarding_oversized_line_ = true;  // drop its tail too, don't run it as a command
             }
             continue;
         }
         if (n == 0) {
-            // EOF on the command stream (e.g. stdin closed, or redirected
-            // from a file/pipe that ran out). Do NOT return early here: with
-            // piped/redirected input (as opposed to an interactive TTY), the
-            // final batch of real commands routinely arrives in the same
-            // read() loop as EOF -- returning immediately would silently
-            // drop everything just appended to command_line_buffer_ above,
-            // since the line-parsing loop below would never run. Break
-            // instead and let that loop see it, same as any other exit path.
+            // EOF; lines from this read were already dispatched above.
             eof = true;
-            break;
-        }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
             break;
         }
         if (errno == EINTR) {
             continue;
         }
-        break;  // any other error: stop trying to read commands, not fatal to the reactor
-    }
-
-    size_t pos;
-    while ((pos = command_line_buffer_.find('\n')) != std::string::npos) {
-        std::string line = command_line_buffer_.substr(0, pos);
-        command_line_buffer_.erase(0, pos + 1);
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        if (on_command_line_) {
-            on_command_line_(line);
-        }
+        drained = true;  // EAGAIN/EWOULDBLOCK: nothing more to read right now
+        break;           // (any other error: stop reading commands, not fatal to the reactor)
     }
 
     if (eof) {
-        // A final command with no trailing newline is still a real command
-        // -- don't drop it just because the stream ended without one (e.g.
-        // `echo -n quit | feed_monitor`, or a heredoc missing its last
-        // newline).
-        if (!command_line_buffer_.empty() && on_command_line_) {
-            on_command_line_(command_line_buffer_);
+        // A final command without a trailing newline still counts (`echo -n quit | ...`).
+        if (!command_line_buffer_.empty() && !discarding_oversized_line_) {
+            dispatch_command_line(std::move(command_line_buffer_));
         }
         command_line_buffer_.clear();
+        discarding_oversized_line_ = false;
         ::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_DEL, command_fd_, nullptr);
         command_fd_ = -1;
+        return;
+    }
+
+    if (!drained && command_fd_ >= 0) {
+        // Stopped before EAGAIN: edge-triggered epoll won't fire again for the
+        // queued data, so MOD re-arms it (re-evaluates readiness) for the next epoll_wait.
+        epoll_event ev{};
+        ev.events = epoll_interest_flags(true, false, config_.edge_triggered);
+        ev.data.fd = command_fd_;
+        if (::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_MOD, command_fd_, &ev) < 0) {
+            std::cerr << "[feed_monitor] epoll_ctl(MOD) failed for command input: " << std::strerror(errno) << "\n";
+        }
     }
 }
 
-void FeedMonitor::set_command_input(int fd, CommandLineCallback on_line) {
-    command_fd_ = fd;
-    on_command_line_ = std::move(on_line);
+bool FeedMonitor::set_command_input(int fd, CommandLineCallback on_line) {
     epoll_event ev{};
     ev.events = epoll_interest_flags(true, false, config_.edge_triggered);
     ev.data.fd = fd;
-    ::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_ADD, fd, &ev);
+    if (::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_ADD, fd, &ev) < 0) {
+        std::cerr << "[feed_monitor] epoll_ctl(ADD) failed for command input fd " << fd << ": "
+                   << std::strerror(errno) << "\n";
+        return false;
+    }
+    command_fd_ = fd;
+    on_command_line_ = std::move(on_line);
+    return true;
 }
 
 void FeedMonitor::set_tick_callback(TickCallback callback) { on_tick_ = std::move(callback); }
 
-void FeedMonitor::set_heartbeat_interval(std::chrono::milliseconds interval) {
+void FeedMonitor::set_alert_callback(AlertCallback callback) { on_alert_ = std::move(callback); }
+
+bool FeedMonitor::set_heartbeat_interval(std::chrono::milliseconds interval) {
+    if (interval <= std::chrono::milliseconds::zero()) {
+        return false;
+    }
     config_.heartbeat_interval = interval;
+    // Pull already-scheduled pings forward so a shorter interval applies immediately.
+    const int64_t now_ns = now_monotonic_ns();
+    const int64_t latest_due_ns =
+        now_ns + std::chrono::duration_cast<std::chrono::nanoseconds>(interval).count();
+    for (Slot& slot : slots_) {
+        slot.next_ping_due_ns = std::min(slot.next_ping_due_ns, latest_due_ns);
+    }
+    return true;
 }
 
-void FeedMonitor::set_heartbeat_timeout(std::chrono::milliseconds timeout) {
+bool FeedMonitor::set_heartbeat_timeout(std::chrono::milliseconds timeout) {
+    if (timeout <= std::chrono::milliseconds::zero()) {
+        return false;
+    }
     config_.heartbeat_timeout = timeout;
-    // Give every connection a fresh liveness baseline under the new timeout
-    // instead of retroactively re-judging however much wait time has
-    // already accumulated against a (possibly much smaller) new budget --
-    // see Connection::reset_liveness_baseline for why. Safe to call
-    // unconditionally across every slot regardless of its current state.
+    // Fresh liveness baseline so accumulated wait isn't judged against the new timeout.
     const int64_t now_ns = now_monotonic_ns();
     for (Slot& slot : slots_) {
         slot.connection.reset_liveness_baseline(now_ns);
     }
+    return true;
 }
 
 AggregateStats FeedMonitor::snapshot_stats() const {

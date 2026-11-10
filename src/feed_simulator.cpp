@@ -10,13 +10,18 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <fcntl.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
-FeedSimulator::FeedSimulator(uint16_t port, uint32_t feed_id, Config config, FaultConfig faults)
-    : feed_id_(feed_id), config_(std::move(config)), faults_(faults) {
+FeedSimulator::FeedSimulator(uint16_t port, uint32_t feed_id, Config config, FaultConfig faults,
+                             const SimulatorOptions& options)
+    : feed_id_(feed_id),
+      config_(std::move(config)),
+      faults_(faults),
+      max_clients_(std::max<size_t>(options.max_clients, 1)) {
     listen_fd_.reset(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
     if (!listen_fd_.valid()) {
         throw_errno("socket() failed");
@@ -27,7 +32,9 @@ FeedSimulator::FeedSimulator(uint16_t port, uint32_t feed_id, Config config, Fau
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (::inet_pton(AF_INET, options.bind_address.c_str(), &addr.sin_addr) != 1) {
+        throw std::runtime_error("invalid IPv4 bind address '" + options.bind_address + "'");
+    }
     addr.sin_port = htons(port);
     if (::bind(listen_fd_.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         throw_errno("bind() failed on port " + std::to_string(port));
@@ -38,8 +45,12 @@ FeedSimulator::FeedSimulator(uint16_t port, uint32_t feed_id, Config config, Fau
 
     sockaddr_in bound{};
     socklen_t bound_len = sizeof(bound);
-    ::getsockname(listen_fd_.get(), reinterpret_cast<sockaddr*>(&bound), &bound_len);
+    if (::getsockname(listen_fd_.get(), reinterpret_cast<sockaddr*>(&bound), &bound_len) < 0) {
+        throw_errno("getsockname() failed");
+    }
     bound_port_ = ntohs(bound.sin_port);
+
+    spare_fd_.reset(::open("/dev/null", O_RDONLY | O_CLOEXEC));  // best-effort
 
     epoll_fd_.reset(::epoll_create1(0));
     if (!epoll_fd_.valid()) {
@@ -82,7 +93,7 @@ FeedSimulator::FeedSimulator(uint16_t port, uint32_t feed_id, Config config, Fau
 }
 
 void FeedSimulator::run() {
-    stop_requested_.store(false, std::memory_order_relaxed);
+    // stop_requested_ is not reset here so a stop() that raced ahead of run() isn't lost.
     while (!stop_requested_.load(std::memory_order_relaxed)) {
         const int n = ::epoll_wait(epoll_fd_.get(), event_batch_.data(),
                                     static_cast<int>(event_batch_.size()), -1);
@@ -95,6 +106,7 @@ void FeedSimulator::run() {
         }
 
         const int64_t now_ns = now_monotonic_ns();
+        removed_in_batch_.clear();
         for (int i = 0; i < n; ++i) {
             const epoll_event& ev = event_batch_[static_cast<size_t>(i)];
             const int fd = ev.data.fd;
@@ -109,15 +121,38 @@ void FeedSimulator::run() {
                 continue;
             }
             if (fd == listen_fd_.get()) {
-                accept_new_connections(now_ns);
+                accept_new_connections();
                 continue;
             }
             if (fd == command_fd_) {
                 on_command_fd_readable();
                 continue;
             }
+            // Stale-event guard: see removed_in_batch_.
+            if (std::find(removed_in_batch_.begin(), removed_in_batch_.end(), fd) !=
+                removed_in_batch_.end()) {
+                continue;
+            }
             handle_client_event(fd, ev.events, now_ns);
         }
+    }
+    send_disconnect_to_all();
+}
+
+void FeedSimulator::send_disconnect_to_all() {
+    // Best-effort; skipped for clients with queued bytes so the message can't
+    // land mid-frame.
+    HeartbeatMessage msg{};
+    msg.type = static_cast<uint8_t>(MessageType::kDisconnect);
+    msg.feed_id = feed_id_;
+    msg.timestamp_ns = now_monotonic_ns();
+    HeartbeatWireBuffer wire;
+    encode_heartbeat(msg, wire);
+    for (auto& [fd, conn] : clients_) {
+        if (conn.state() == ConnectionState::kFailed || conn.wants_write()) {
+            continue;
+        }
+        [[maybe_unused]] const ssize_t sent = ::send(fd, wire.data(), wire.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
     }
 }
 
@@ -127,8 +162,19 @@ void FeedSimulator::stop() {
     [[maybe_unused]] const ssize_t discard = ::write(wake_fd_.get(), &one, sizeof(one));
 }
 
-void FeedSimulator::accept_new_connections(int64_t now_ns) {
-    (void)now_ns;  // Connection's constructor stamps its own state_entered_ns_ via now_monotonic_ns()
+void FeedSimulator::disarm_listener() {
+    // Leaving the listener armed after an unfixable accept4() failure would
+    // spin (level-triggered) or stall (edge-triggered). Mask it; the next tick
+    // re-arms it, and EPOLL_CTL_MOD re-evaluates readiness.
+    epoll_event ev{};
+    ev.events = 0;
+    ev.data.fd = listen_fd_.get();
+    ::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_MOD, listen_fd_.get(), &ev);
+    listener_disarmed_ = true;
+}
+
+void FeedSimulator::accept_new_connections() {
+    bool logged = false;  // at most one stderr line per call
     while (true) {
         sockaddr_in peer_addr{};
         socklen_t addr_len = sizeof(peer_addr);
@@ -136,13 +182,45 @@ void FeedSimulator::accept_new_connections(int64_t now_ns) {
                                          &addr_len, SOCK_NONBLOCK);
         if (client_fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;  // drained -- mandatory exit condition under edge-triggered epoll
+                break;  // drained (required under edge-triggered epoll)
             }
             if (errno == EINTR || errno == ECONNABORTED) {
                 continue;  // transient; try the next pending connection
             }
-            std::cerr << "[feed_simulator] accept4() failed: " << std::strerror(errno) << "\n";
+            const int err = errno;
+            if (!logged) {
+                std::cerr << "[feed_simulator] accept4() failed: " << std::strerror(err) << "\n";
+                logged = true;
+            }
+            if ((err == EMFILE || err == ENFILE) && spare_fd_.valid()) {
+                // Out of fds: free the spare, accept-and-close the queued
+                // connection to drain the backlog, then re-reserve the spare.
+                spare_fd_.reset();
+                const int shed = ::accept4(listen_fd_.get(), nullptr, nullptr, SOCK_CLOEXEC);
+                const int shed_errno = errno;
+                if (shed >= 0) {
+                    ::close(shed);
+                }
+                spare_fd_.reset(::open("/dev/null", O_RDONLY | O_CLOEXEC));
+                if (shed >= 0) {
+                    continue;
+                }
+                if (shed_errno == EAGAIN || shed_errno == EWOULDBLOCK) {
+                    break;
+                }
+            }
+            disarm_listener();  // unrecoverable here: retry on the next tick
             break;
+        }
+
+        if (clients_.size() >= max_clients_) {
+            // Unauthenticated peers must not be able to exhaust fds.
+            ::close(client_fd);
+            if (!logged) {
+                std::cerr << "[feed_simulator] client cap (" << max_clients_ << ") reached -- refusing connections\n";
+                logged = true;
+            }
+            continue;
         }
 
         char ip_buf[INET_ADDRSTRLEN] = {};
@@ -151,7 +229,7 @@ void FeedSimulator::accept_new_connections(int64_t now_ns) {
 
         auto [it, inserted] = clients_.try_emplace(client_fd, client_fd, Role::kResponder, feed_id_,
                                                     std::string(ip_buf), peer_port, config_);
-        (void)inserted;  // fd just came from accept4() -- always a fresh key
+        (void)inserted;  // fd just came from accept4(): always a fresh key
 
         it->second.set_ping_interceptor([this, client_fd](uint64_t seq, int64_t ts) {
             return on_ping_intercept(client_fd, seq, ts);
@@ -170,7 +248,7 @@ void FeedSimulator::accept_new_connections(int64_t now_ns) {
 void FeedSimulator::handle_client_event(int fd, uint32_t events, int64_t now_ns) {
     auto it = clients_.find(fd);
     if (it == clients_.end()) [[unlikely]] {
-        return;  // stale event for an fd already removed earlier in this same batch
+        return;  // stale event for an fd removed earlier in this batch
     }
     Connection& conn = it->second;
 
@@ -204,26 +282,27 @@ void FeedSimulator::sync_epoll_interest(int fd, Connection& conn) {
 
 void FeedSimulator::remove_client(int fd) {
     ::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_DEL, fd, nullptr);
-    // Purge any fault-injection replies still pending for this fd before it's
-    // closed and the fd number becomes eligible for reuse by a later accept()
-    // -- otherwise a stale deferred PONG could misfire at an unrelated future
-    // client that happens to get the same fd number.
+    // Purge deferred replies first: a later accept() may reuse this fd number.
     pending_replies_.erase(
         std::remove_if(pending_replies_.begin(), pending_replies_.end(),
                         [fd](const PendingReply& p) { return p.fd == fd; }),
         pending_replies_.end());
-    clients_.erase(fd);  // destroys the Connection, whose UniqueFd closes fd
+    clients_.erase(fd);  // the Connection's UniqueFd closes fd
+    removed_in_batch_.push_back(fd);
 }
 
 bool FeedSimulator::on_ping_intercept(int fd, uint64_t sequence, int64_t timestamp_ns) {
     if (faults_.drop_probability > 0.0) {
         std::uniform_real_distribution<double> coin(0.0, 1.0);
         if (coin(rng_) < faults_.drop_probability) {
-            return false;  // dropped for good -- no deferred send scheduled
+            return false;  // dropped
         }
     }
 
     if (faults_.extra_latency.count() > 0) {
+        if (pending_replies_.size() >= kMaxPendingReplies) {
+            return false;  // queue full: drop rather than grow without bound
+        }
         int64_t delay_ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(faults_.extra_latency).count();
         if (faults_.jitter) {
@@ -231,10 +310,10 @@ bool FeedSimulator::on_ping_intercept(int fd, uint64_t sequence, int64_t timesta
             delay_ns = static_cast<int64_t>(static_cast<double>(delay_ns) * factor(rng_));
         }
         pending_replies_.push_back(PendingReply{now_monotonic_ns() + delay_ns, fd, sequence, timestamp_ns});
-        return false;  // suppress the immediate reply; on_timer_tick will send it later
+        return false;  // on_timer_tick sends it later
     }
 
-    return true;  // no active faults -- reply immediately, as normal
+    return true;  // no active faults: reply immediately
 }
 
 void FeedSimulator::on_timer_tick() {
@@ -243,13 +322,20 @@ void FeedSimulator::on_timer_tick() {
 
     const int64_t now_ns = now_monotonic_ns();
 
-    // F13: reap any client that's gone silent -- stuck mid-handshake (never
-    // sent CONNECT_HELLO) or healthy but no longer sending PING. Without
-    // this, a hung/slow-loris test client occupies a Connection+fd forever;
-    // this reuses the tick already wired up for the deferred-reply queue
-    // below rather than adding a second timer. Collect failed fds into a
-    // separate vector first: remove_client() erases from clients_, and
-    // mutating an unordered_map while range-for iterating it is UB.
+    // The tick is the retry timer for a disarmed listener / lost spare fd.
+    if (!spare_fd_.valid()) {
+        spare_fd_.reset(::open("/dev/null", O_RDONLY | O_CLOEXEC));
+    }
+    if (listener_disarmed_) {
+        listener_disarmed_ = false;
+        epoll_event ev{};
+        ev.events = epoll_interest_flags(/*readable=*/true, /*writable=*/false, config_.edge_triggered);
+        ev.data.fd = listen_fd_.get();
+        ::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_MOD, listen_fd_.get(), &ev);
+    }
+
+    // Reap silent clients (stuck handshake or no PINGs). Collect first:
+    // remove_client() erases from clients_ while we iterate it.
     std::vector<int> failed_fds;
     for (auto& [fd, conn] : clients_) {
         if (conn.check_timeout(now_ns)) {
@@ -266,6 +352,7 @@ void FeedSimulator::on_timer_tick() {
 
     std::vector<PendingReply> still_pending;
     still_pending.reserve(pending_replies_.size());
+    std::vector<int> failed_by_send;  // remove_client() edits pending_replies_; defer past the loop
 
     for (const PendingReply& pending : pending_replies_) {
         if (now_ns < pending.fire_at_ns) {
@@ -275,11 +362,22 @@ void FeedSimulator::on_timer_tick() {
         auto it = clients_.find(pending.fd);
         if (it != clients_.end()) {
             it->second.send_pong(pending.sequence, pending.timestamp_ns);
-            sync_epoll_interest(pending.fd, it->second);  // the queued reply may need EPOLLOUT armed
+            if (it->second.state() == ConnectionState::kFailed) {
+                // Write queue overflowed; check_timeout() skips kFailed
+                // connections, so reap it here.
+                failed_by_send.push_back(pending.fd);
+            } else {
+                sync_epoll_interest(pending.fd, it->second);  // reply may need EPOLLOUT
+            }
         }
-        // else: client disconnected before its deferred reply fired -- nothing to send to, just drop it.
+        // else: client left before its reply fired; drop it.
     }
     pending_replies_ = std::move(still_pending);
+    for (const int fd : failed_by_send) {
+        if (clients_.count(fd) != 0) {  // an fd can repeat
+            remove_client(fd);
+        }
+    }
 }
 
 void FeedSimulator::kill_random_connection() {
@@ -291,12 +389,6 @@ void FeedSimulator::kill_random_connection() {
     std::advance(it, static_cast<long>(pick(rng_)));
     const int fd = it->first;
 
-    // SO_LINGER{on=1, linger=0} makes the close() inside remove_client() send
-    // a raw RST instead of a graceful FIN -- simulating the exchange
-    // abruptly crashing rather than shutting down cleanly, so the monitor
-    // exercises its ECONNRESET path (Connection::on_hangup_or_error)
-    // specifically, not just the "peer closed" EOF path already covered by a
-    // normal disconnect.
     struct linger sl{1, 0};
     ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
 
@@ -306,65 +398,90 @@ void FeedSimulator::kill_random_connection() {
 void FeedSimulator::set_fault_config(FaultConfig faults) { faults_ = faults; }
 
 void FeedSimulator::set_command_input(int fd, CommandLineCallback on_line) {
-    command_fd_ = fd;
-    on_command_line_ = std::move(on_line);
     epoll_event ev{};
     ev.events = epoll_interest_flags(true, false, config_.edge_triggered);
     ev.data.fd = fd;
-    ::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_ADD, fd, &ev);
+    if (::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_ADD, fd, &ev) < 0) {
+        throw_errno("epoll_ctl(command fd) failed");  // e.g. EPERM for a regular file
+    }
+    command_fd_ = fd;
+    on_command_line_ = std::move(on_line);
+}
+
+void FeedSimulator::close_command_input() {
+    ::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_DEL, command_fd_, nullptr);
+    command_fd_ = -1;  // the fd belongs to the caller; we only stop watching it
+    command_line_buffer_.clear();
+    discarding_oversized_line_ = false;
+}
+
+// Dispatches complete lines, then applies the length cap to the unterminated
+// remainder (a cap per line, not per wakeup). An oversized line is dropped in
+// full, including its tail up to the next '\n'.
+void FeedSimulator::process_command_buffer() {
+    size_t start = 0;
+    size_t pos;
+    while ((pos = command_line_buffer_.find('\n', start)) != std::string::npos) {
+        if (discarding_oversized_line_) {
+            discarding_oversized_line_ = false;  // this '\n' ends the oversized line
+        } else {
+            std::string line = command_line_buffer_.substr(start, pos - start);
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            if (on_command_line_) {
+                on_command_line_(line);
+            }
+        }
+        start = pos + 1;
+    }
+    command_line_buffer_.erase(0, start);
+
+    if (discarding_oversized_line_) {
+        command_line_buffer_.clear();  // everything left is still part of the oversized line
+    } else if (command_line_buffer_.size() > kMaxCommandLineBufferBytes) {
+        std::cerr << "[feed_simulator] command line exceeded " << kMaxCommandLineBufferBytes
+                  << " bytes without a newline -- discarding it\n";
+        command_line_buffer_.clear();
+        discarding_oversized_line_ = true;
+    }
 }
 
 void FeedSimulator::on_command_fd_readable() {
-    char buf[1024];
-    bool eof = false;
-    while (true) {
+    // Bounded reads per wakeup so this fd can't starve client I/O. If the bound
+    // is hit before EAGAIN, re-arm with EPOLL_CTL_MOD (edge-triggered epoll
+    // would otherwise never fire again for the queued data).
+    constexpr int kMaxReadsPerWakeup = 16;
+    char buf[4096];
+    for (int i = 0; i < kMaxReadsPerWakeup; ++i) {
         const ssize_t n = ::read(command_fd_, buf, sizeof(buf));
         if (n > 0) {
             command_line_buffer_.append(buf, static_cast<size_t>(n));
-            if (command_line_buffer_.size() > kMaxCommandLineBufferBytes) {
-                std::cerr << "[feed_simulator] command line exceeded " << kMaxCommandLineBufferBytes
-                          << " bytes without a newline -- discarding buffered input\n";
-                command_line_buffer_.clear();
-            }
+            process_command_buffer();
             continue;
         }
         if (n == 0) {
-            // Do NOT return early here -- see the matching comment in
-            // FeedMonitor::on_command_fd_readable (feed_monitor.cpp): with
-            // piped/redirected input, EOF routinely arrives in the same
-            // read() loop as the final real commands, and returning
-            // immediately would silently drop whatever was just appended to
-            // command_line_buffer_ above.
-            eof = true;
-            break;
+            // EOF: only an unterminated last line remains undispatched.
+            if (!discarding_oversized_line_ && !command_line_buffer_.empty() && on_command_line_) {
+                on_command_line_(command_line_buffer_);
+            }
+            close_command_input();
+            return;
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            break;
+            return;  // drained
         }
         if (errno == EINTR) {
             continue;
         }
-        break;
+        std::cerr << "[feed_simulator] command input read() failed: " << std::strerror(errno)
+                  << " -- no longer reading commands\n";
+        close_command_input();
+        return;
     }
 
-    size_t pos;
-    while ((pos = command_line_buffer_.find('\n')) != std::string::npos) {
-        std::string line = command_line_buffer_.substr(0, pos);
-        command_line_buffer_.erase(0, pos + 1);
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        if (on_command_line_) {
-            on_command_line_(line);
-        }
-    }
-
-    if (eof) {
-        if (!command_line_buffer_.empty() && on_command_line_) {
-            on_command_line_(command_line_buffer_);
-        }
-        command_line_buffer_.clear();
-        ::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_DEL, command_fd_, nullptr);
-        command_fd_ = -1;
-    }
+    epoll_event ev{};
+    ev.events = epoll_interest_flags(true, false, config_.edge_triggered);
+    ev.data.fd = command_fd_;
+    ::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_MOD, command_fd_, &ev);
 }

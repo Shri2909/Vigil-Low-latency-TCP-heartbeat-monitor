@@ -90,3 +90,16 @@ TEST_CASE("percentile interpolates between ranks on an even-sized dataset") {
     // rank = 0.5 * 3 = 1.5 -> interpolate between index 1 (20) and index 2 (30)
     CHECK(percentile(data, 50.0) == 25.0);
 }
+
+TEST_CASE("percentile with a NaN p returns 0 instead of invoking undefined behavior") {
+    std::vector<int64_t> data = {10, 20, 30, 40};
+    CHECK(percentile(data, std::numeric_limits<double>::quiet_NaN()) == 0.0);
+}
+
+TEST_CASE("percentile clamps out-of-range and infinite p to min/max") {
+    std::vector<int64_t> data = {10, 20, 30, 40};
+    CHECK(percentile(data, -5.0) == 10.0);
+    CHECK(percentile(data, 250.0) == 40.0);
+    CHECK(percentile(data, std::numeric_limits<double>::infinity()) == 40.0);
+    CHECK(percentile(data, -std::numeric_limits<double>::infinity()) == 10.0);
+}

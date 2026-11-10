@@ -1,14 +1,16 @@
 #include "config.h"
 
+#include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <climits>
+#include <filesystem>
 #include <fstream>
-#include <getopt.h>
 #include <iostream>
 #include <limits>
 #include <optional>
-#include <sstream>
-#include <unordered_set>
+
+#include <getopt.h>
 
 namespace {
 
@@ -42,72 +44,108 @@ std::optional<long long> try_parse_int(const std::string& s) {
     return value;
 }
 
-std::optional<bool> try_parse_bool(const std::string& s) {
+// Case-insensitive: "TRUE", "True", "No" are all accepted.
+std::optional<bool> try_parse_bool(const std::string& raw) {
+    std::string s = raw;
+    for (char& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
     if (s == "true" || s == "1" || s == "yes") return true;
     if (s == "false" || s == "0" || s == "no") return false;
     return std::nullopt;
 }
 
-bool is_valid_log_level(const std::string& s) {
-    static const std::unordered_set<std::string> kLevels = {"trace", "debug", "info", "warn",
-                                                              "error"};
-    return kLevels.count(s) != 0;
-}
+// Upper bounds: ints are narrowed from long long (cap at INT_MAX); durations are capped at one day so
+// duration_cast<nanoseconds> cannot overflow and typo'd values are rejected.
+constexpr long long kMaxDurationMs = 86'400'000;
+// epoll_max_events sizes the epoll_wait output array, so INT_MAX would mean a ~25 GB allocation.
+constexpr long long kMaxEpollEvents = 1'000'000;
 
-// Parses raw as an integer and requires it to be >= min_value; otherwise logs
-// via `context` (e.g. "line 12" or "--heartbeat-interval-ms") and returns
-// nullopt so the caller keeps its current/default value untouched. Shared by
-// both the file parser (apply_global_key) and the CLI (apply_cli_overrides)
-// so every numeric duration/count field is validated the same way -- before
-// this, only feed port/id had range checks; fields like heartbeat_interval_ms
-// or epoll_max_events silently accepted 0/negative/absurd values, despite
-// config.h's own doc comment promising invalid values are rejected.
-std::optional<long long> require_int_at_least(const std::string& raw, const std::string& field_name,
-                                               const std::string& context, long long min_value) {
+// Parses raw as an integer in [min_value, max_value]; otherwise warns (prefixed with context) and
+// returns nullopt so the caller keeps its current value. Shared by the file parser and the CLI.
+std::optional<long long> require_int_in_range(const std::string& raw, const std::string& field_name,
+                                               const std::string& context, long long min_value,
+                                               long long max_value) {
     auto v = try_parse_int(raw);
     if (!v) {
         warn(context + ": invalid integer for '" + field_name + "': '" + raw + "', keeping default");
         return std::nullopt;
     }
-    if (*v < min_value) {
-        warn(context + ": '" + field_name + "' must be >= " + std::to_string(min_value) + ", got '" +
-             raw + "', keeping default");
+    if (*v < min_value || *v > max_value) {
+        warn(context + ": '" + field_name + "' must be in [" + std::to_string(min_value) + ", " +
+             std::to_string(max_value) + "], got '" + raw + "', keeping default");
         return std::nullopt;
     }
     return v;
 }
 
-// Applies a single global (non-[feed]) key=value pair to config. Shared by the
-// file parser; the CLI has its own flags for the same fields (getopt_long
-// doesn't let us reuse a key=value dispatch table cleanly), see
-// apply_cli_overrides.
+std::optional<std::chrono::milliseconds> parse_duration_ms(const std::string& raw, const std::string& field_name,
+                                                            const std::string& context) {
+    if (auto v = require_int_in_range(raw, field_name, context, 1, kMaxDurationMs)) {
+        return std::chrono::milliseconds(*v);
+    }
+    return std::nullopt;
+}
+
+std::optional<int> parse_int_field(const std::string& raw, const std::string& field_name,
+                                    const std::string& context, long long min_value,
+                                    long long max_value = INT_MAX) {
+    if (auto v = require_int_in_range(raw, field_name, context, min_value, max_value)) {
+        return static_cast<int>(*v);
+    }
+    return std::nullopt;
+}
+
+// Cross-field checks, run once after a whole file/CLI is applied. A violating pair reverts to the
+// (mutually consistent) defaults.
+void validate_cross_fields(Config& config, const std::string& source) {
+    const Config defaults;
+    if (config.reconnect_base_delay > config.reconnect_max_delay) {
+        warn(source + ": reconnect_base_delay_ms (" + std::to_string(config.reconnect_base_delay.count()) +
+             ") must be <= reconnect_max_delay_ms (" + std::to_string(config.reconnect_max_delay.count()) +
+             "), reverting both to defaults");
+        config.reconnect_base_delay = defaults.reconnect_base_delay;
+        config.reconnect_max_delay = defaults.reconnect_max_delay;
+    }
+    if (config.heartbeat_interval >= config.heartbeat_timeout) {
+        warn(source + ": heartbeat_interval_ms (" + std::to_string(config.heartbeat_interval.count()) +
+             ") must be < heartbeat_timeout_ms (" + std::to_string(config.heartbeat_timeout.count()) +
+             "), reverting both to defaults");
+        config.heartbeat_interval = defaults.heartbeat_interval;
+        config.heartbeat_timeout = defaults.heartbeat_timeout;
+    }
+    if (config.tick_interval > config.heartbeat_interval) {
+        // A tick coarser than the heartbeat interval can't send pings on time.
+        const auto fixed = std::min(defaults.tick_interval, config.heartbeat_interval);
+        warn(source + ": tick_interval_ms (" + std::to_string(config.tick_interval.count()) +
+             ") must be <= heartbeat_interval_ms (" + std::to_string(config.heartbeat_interval.count()) +
+             "), using " + std::to_string(fixed.count()));
+        config.tick_interval = fixed;
+    }
+}
+
+// Applies one global (non-[feed]) key=value pair; the CLI has its own getopt_long dispatch.
 void apply_global_key(Config& config, const std::string& key, const std::string& value,
                        int line_number) {
     const std::string context = "line " + std::to_string(line_number);
 
     if (key == "heartbeat_interval_ms") {
-        if (auto v = require_int_at_least(value, key, context, 1))
-            config.heartbeat_interval = std::chrono::milliseconds(*v);
+        if (auto v = parse_duration_ms(value, key, context)) config.heartbeat_interval = *v;
     } else if (key == "heartbeat_timeout_ms") {
-        if (auto v = require_int_at_least(value, key, context, 1))
-            config.heartbeat_timeout = std::chrono::milliseconds(*v);
+        if (auto v = parse_duration_ms(value, key, context)) config.heartbeat_timeout = *v;
     } else if (key == "max_missed_heartbeats") {
-        if (auto v = require_int_at_least(value, key, context, 1)) config.max_missed_heartbeats = static_cast<int>(*v);
+        if (auto v = parse_int_field(value, key, context, 1)) config.max_missed_heartbeats = *v;
     } else if (key == "reconnect_base_delay_ms") {
-        if (auto v = require_int_at_least(value, key, context, 1))
-            config.reconnect_base_delay = std::chrono::milliseconds(*v);
+        if (auto v = parse_duration_ms(value, key, context)) config.reconnect_base_delay = *v;
     } else if (key == "reconnect_max_delay_ms") {
-        if (auto v = require_int_at_least(value, key, context, 1))
-            config.reconnect_max_delay = std::chrono::milliseconds(*v);
+        if (auto v = parse_duration_ms(value, key, context)) config.reconnect_max_delay = *v;
     } else if (key == "max_reconnect_attempts") {
-        // -1 is a legitimate sentinel ("unlimited", see config.h), not an error.
-        if (auto v = require_int_at_least(value, key, context, -1))
-            config.max_reconnect_attempts = static_cast<int>(*v);
+        // -1 means unlimited.
+        if (auto v = parse_int_field(value, key, context, -1)) config.max_reconnect_attempts = *v;
     } else if (key == "epoll_max_events") {
-        if (auto v = require_int_at_least(value, key, context, 1)) config.epoll_max_events = static_cast<int>(*v);
+        if (auto v = parse_int_field(value, key, context, 1, kMaxEpollEvents)) config.epoll_max_events = *v;
     } else if (key == "tick_interval_ms") {
-        if (auto v = require_int_at_least(value, key, context, 1))
-            config.tick_interval = std::chrono::milliseconds(*v);
+        if (auto v = parse_duration_ms(value, key, context)) config.tick_interval = *v;
     } else if (key == "tcp_nodelay") {
         if (auto v = try_parse_bool(value)) {
             config.tcp_nodelay = *v;
@@ -121,13 +159,6 @@ void apply_global_key(Config& config, const std::string& key, const std::string&
         } else {
             warn("line " + std::to_string(line_number) +
                  ": invalid boolean for 'edge_triggered': '" + value + "', keeping default");
-        }
-    } else if (key == "log_level") {
-        if (is_valid_log_level(value)) {
-            config.log_level = value;
-        } else {
-            warn("line " + std::to_string(line_number) + ": invalid log_level '" + value +
-                 "', keeping default '" + config.log_level + "'");
         }
     } else {
         warn("line " + std::to_string(line_number) + ": unknown config key '" + key +
@@ -144,10 +175,8 @@ struct PendingFeed {
     int start_line = 0;
 };
 
-// Validates and, if valid, appends the feed to config.feeds. Invalid or
-// duplicate-id feeds are logged and dropped -- one bad [feed] section never
-// prevents the other feeds in the file (or on the CLI) from being monitored.
-// Shared by the file parser and the CLI's --feed flag.
+// Validates and appends a feed; invalid or duplicate-id feeds are warned about and dropped. Shared by
+// the file parser and --feed.
 void validate_and_add_feed(Config& config, const std::optional<std::string>& id_str,
                             const std::optional<std::string>& name,
                             const std::optional<std::string>& host,
@@ -158,14 +187,14 @@ void validate_and_add_feed(Config& config, const std::optional<std::string>& id_
         return;
     }
     auto id_value = try_parse_int(*id_str);
-    // feed_id is stored as uint32_t (FeedEndpoint::feed_id, config.h); without
-    // the upper-bound check, a too-large value (a typo, or a pasted unrelated
-    // number) would pass this check and then silently wrap around at the
-    // static_cast<uint32_t> below instead of being rejected -- e.g.
-    // id=99999999999 would silently become feed_id 1410065407.
+    // Bound-check before the uint32_t cast so a huge id is rejected instead of wrapping.
     if (!id_value || *id_value < 0 || *id_value > static_cast<long long>(std::numeric_limits<uint32_t>::max())) {
         warn(context + ": invalid feed id '" + *id_str + "' (must be 0-" +
              std::to_string(std::numeric_limits<uint32_t>::max()) + "), skipping");
+        return;
+    }
+    if (name->empty()) {
+        warn(context + ": empty feed name, skipping");
         return;
     }
     if (host->empty()) {
@@ -189,7 +218,7 @@ void validate_and_add_feed(Config& config, const std::optional<std::string>& id_
 
 void commit_pending_feed(Config& config, const PendingFeed& pending) {
     if (pending.start_line == 0) {
-        return;  // no [feed] section has been opened yet
+        return;  // no [feed] section open
     }
     validate_and_add_feed(config, pending.id, pending.name, pending.host, pending.port,
                            "[feed] at line " + std::to_string(pending.start_line));
@@ -198,6 +227,11 @@ void commit_pending_feed(Config& config, const PendingFeed& pending) {
 }  // namespace
 
 Config parse_config_file(const std::string& path) {
+    // ifstream opens a directory "successfully" and then fails every read; reject it up front.
+    std::error_code ec;
+    if (std::filesystem::is_directory(path, ec)) {
+        throw std::runtime_error("config path is a directory, not a file: " + path);
+    }
     std::ifstream file(path);
     if (!file.is_open()) {
         throw std::runtime_error("could not open config file: " + path);
@@ -205,22 +239,36 @@ Config parse_config_file(const std::string& path) {
 
     Config config;
     PendingFeed pending;
-    bool in_feed_section = false;
+    enum class Section { kGlobal, kFeed, kUnknown } section = Section::kGlobal;
     std::string raw_line;
     int line_number = 0;
 
     while (std::getline(file, raw_line)) {
         ++line_number;
+        // A '#' preceded by whitespace starts an inline comment; a glued '#' stays in the value.
+        for (size_t i = 1; i < raw_line.size(); ++i) {
+            if (raw_line[i] == '#' && std::isspace(static_cast<unsigned char>(raw_line[i - 1]))) {
+                raw_line.erase(i);
+                break;
+            }
+        }
         const std::string line = trim(raw_line);
         if (line.empty() || line[0] == '#' || line[0] == ';') {
             continue;
         }
 
-        if (line == "[feed]") {
+        if (line.front() == '[' && line.back() == ']') {
+            // A section header ends the previous section.
             commit_pending_feed(config, pending);
             pending = PendingFeed{};
-            pending.start_line = line_number;
-            in_feed_section = true;
+            if (line == "[feed]") {
+                pending.start_line = line_number;
+                section = Section::kFeed;
+            } else {
+                warn("line " + std::to_string(line_number) + ": unknown section '" + line +
+                     "', skipping its keys");
+                section = Section::kUnknown;
+            }
             continue;
         }
 
@@ -233,17 +281,26 @@ Config parse_config_file(const std::string& path) {
         const std::string key = trim(line.substr(0, eq));
         const std::string value = trim(line.substr(eq + 1));
 
-        if (in_feed_section) {
-            if (key == "id") pending.id = value;
-            else if (key == "name") pending.name = value;
-            else if (key == "host") pending.host = value;
-            else if (key == "port") pending.port = value;
-            else warn("line " + std::to_string(line_number) + ": unknown feed key '" + key + "', ignoring");
-        } else {
-            apply_global_key(config, key, value, line_number);
+        switch (section) {
+            case Section::kFeed:
+                if (key == "id") pending.id = value;
+                else if (key == "name") pending.name = value;
+                else if (key == "host") pending.host = value;
+                else if (key == "port") pending.port = value;
+                else warn("line " + std::to_string(line_number) + ": unknown feed key '" + key + "', ignoring");
+                break;
+            case Section::kUnknown:
+                break;  // warned at the section header
+            case Section::kGlobal:
+                apply_global_key(config, key, value, line_number);
+                break;
         }
     }
+    if (file.bad()) {
+        throw std::runtime_error("error reading config file: " + path);
+    }
     commit_pending_feed(config, pending);
+    validate_cross_fields(config, "config file '" + path + "'");
 
     return config;
 }
@@ -261,7 +318,6 @@ enum LongOptId {
     kOptTickIntervalMs,
     kOptTcpNodelay,
     kOptEdgeTriggered,
-    kOptLogLevel,
     kOptFeed,
     kOptConfig,
 };
@@ -279,22 +335,26 @@ const struct option kLongOptions[] = {
     {"tick-interval-ms",           required_argument, nullptr, kOptTickIntervalMs},
     {"tcp-nodelay",                required_argument, nullptr, kOptTcpNodelay},
     {"edge-triggered",             required_argument, nullptr, kOptEdgeTriggered},
-    {"log-level",                  required_argument, nullptr, kOptLogLevel},
     {"feed",                       required_argument, nullptr, kOptFeed},
     {"help",                       no_argument,        nullptr, 'h'},
     {nullptr, 0, nullptr, 0},
 };
 // clang-format on
 
-// Splits "id:name:host:port" for --feed. Returns false if the shape is wrong
-// (wrong field count); validate_and_add_feed still validates field contents.
+// Splits "id:name:host:port". Empty fields are kept so "1::host:9" is an empty name, not 3 fields;
+// validate_and_add_feed checks the contents.
 bool split_feed_spec(const std::string& spec, std::string* id, std::string* name,
                       std::string* host, std::string* port) {
     std::vector<std::string> parts;
-    std::stringstream ss(spec);
-    std::string part;
-    while (std::getline(ss, part, ':')) {
-        parts.push_back(part);
+    size_t start = 0;
+    while (true) {
+        const size_t colon = spec.find(':', start);
+        if (colon == std::string::npos) {
+            parts.push_back(spec.substr(start));
+            break;
+        }
+        parts.push_back(spec.substr(start, colon - start));
+        start = colon + 1;
     }
     if (parts.size() != 4) {
         return false;
@@ -309,18 +369,13 @@ bool split_feed_spec(const std::string& spec, std::string* id, std::string* name
 }  // namespace
 
 Config apply_cli_overrides(Config base, int argc, char** argv) {
-    // getopt_long is process-global state (optind); reset it so repeated calls
-    // in the same process -- e.g. from config_test.cpp's individual test
-    // cases -- don't see stale state from a previous call.
+    // getopt_long keeps global state; reset it so repeated calls (tests) start clean.
     optind = 1;
-    opterr = 0;  // we print our own diagnostics below
+    opterr = 0;  // diagnostics are printed below
 
     Config config = std::move(base);
 
-    // First pass: --config only. If present, it becomes the new base, and CLI
-    // flags (applied in the second pass) still win over whatever it contains --
-    // matching the "CLI > --config file > built-in defaults" precedence
-    // documented in config.h.
+    // First pass: --config only, so it becomes the base that the CLI flags then override.
     int c;
     while ((c = getopt_long(argc, argv, "h", kLongOptions, nullptr)) != -1) {
         if (c == kOptConfig) {
@@ -341,37 +396,37 @@ Config apply_cli_overrides(Config base, int argc, char** argv) {
                 config.help_requested = true;
                 break;
             case kOptHeartbeatIntervalMs:
-                if (auto v = require_int_at_least(optarg, "heartbeat-interval-ms", "--heartbeat-interval-ms", 1))
-                    config.heartbeat_interval = std::chrono::milliseconds(*v);
+                if (auto v = parse_duration_ms(optarg, "heartbeat-interval-ms", "--heartbeat-interval-ms"))
+                    config.heartbeat_interval = *v;
                 break;
             case kOptHeartbeatTimeoutMs:
-                if (auto v = require_int_at_least(optarg, "heartbeat-timeout-ms", "--heartbeat-timeout-ms", 1))
-                    config.heartbeat_timeout = std::chrono::milliseconds(*v);
+                if (auto v = parse_duration_ms(optarg, "heartbeat-timeout-ms", "--heartbeat-timeout-ms"))
+                    config.heartbeat_timeout = *v;
                 break;
             case kOptMaxMissed:
-                if (auto v = require_int_at_least(optarg, "max-missed", "--max-missed", 1))
-                    config.max_missed_heartbeats = static_cast<int>(*v);
+                if (auto v = parse_int_field(optarg, "max-missed", "--max-missed", 1))
+                    config.max_missed_heartbeats = *v;
                 break;
             case kOptReconnectBaseDelayMs:
-                if (auto v = require_int_at_least(optarg, "reconnect-base-delay-ms", "--reconnect-base-delay-ms", 1))
-                    config.reconnect_base_delay = std::chrono::milliseconds(*v);
+                if (auto v = parse_duration_ms(optarg, "reconnect-base-delay-ms", "--reconnect-base-delay-ms"))
+                    config.reconnect_base_delay = *v;
                 break;
             case kOptReconnectMaxDelayMs:
-                if (auto v = require_int_at_least(optarg, "reconnect-max-delay-ms", "--reconnect-max-delay-ms", 1))
-                    config.reconnect_max_delay = std::chrono::milliseconds(*v);
+                if (auto v = parse_duration_ms(optarg, "reconnect-max-delay-ms", "--reconnect-max-delay-ms"))
+                    config.reconnect_max_delay = *v;
                 break;
             case kOptMaxReconnectAttempts:
-                // -1 is a legitimate sentinel ("unlimited", see config.h), not an error.
-                if (auto v = require_int_at_least(optarg, "max-reconnect-attempts", "--max-reconnect-attempts", -1))
-                    config.max_reconnect_attempts = static_cast<int>(*v);
+                // -1 means unlimited.
+                if (auto v = parse_int_field(optarg, "max-reconnect-attempts", "--max-reconnect-attempts", -1))
+                    config.max_reconnect_attempts = *v;
                 break;
             case kOptEpollMaxEvents:
-                if (auto v = require_int_at_least(optarg, "epoll-max-events", "--epoll-max-events", 1))
-                    config.epoll_max_events = static_cast<int>(*v);
+                if (auto v = parse_int_field(optarg, "epoll-max-events", "--epoll-max-events", 1, kMaxEpollEvents))
+                    config.epoll_max_events = *v;
                 break;
             case kOptTickIntervalMs:
-                if (auto v = require_int_at_least(optarg, "tick-interval-ms", "--tick-interval-ms", 1))
-                    config.tick_interval = std::chrono::milliseconds(*v);
+                if (auto v = parse_duration_ms(optarg, "tick-interval-ms", "--tick-interval-ms"))
+                    config.tick_interval = *v;
                 break;
             case kOptTcpNodelay:
                 if (auto v = try_parse_bool(optarg)) config.tcp_nodelay = *v;
@@ -380,10 +435,6 @@ Config apply_cli_overrides(Config base, int argc, char** argv) {
             case kOptEdgeTriggered:
                 if (auto v = try_parse_bool(optarg)) config.edge_triggered = *v;
                 else warn(std::string("--edge-triggered: invalid boolean '") + optarg + "'");
-                break;
-            case kOptLogLevel:
-                if (is_valid_log_level(optarg)) config.log_level = optarg;
-                else warn(std::string("--log-level: invalid level '") + optarg + "'");
                 break;
             case kOptFeed: {
                 std::string id, name, host, port;
@@ -397,11 +448,13 @@ Config apply_cli_overrides(Config base, int argc, char** argv) {
             }
             case '?':
             default:
-                warn("unrecognized command-line option, ignoring");
+                warn(std::string("unrecognized or incomplete command-line option '") + argv[optind - 1] +
+                     "', ignoring");
                 break;
         }
     }
 
+    validate_cross_fields(config, "command line");
     return config;
 }
 
@@ -421,6 +474,5 @@ void print_usage(const char* prog_name) {
         "  --tick-interval-ms <n>             heartbeat/timeout check cadence [default 50]\n"
         "  --tcp-nodelay <true|false>         [default true]\n"
         "  --edge-triggered <true|false>      [default true]\n"
-        "  --log-level <trace|debug|info|warn|error>  [default info]\n"
         "  -h, --help                         show this message\n";
 }

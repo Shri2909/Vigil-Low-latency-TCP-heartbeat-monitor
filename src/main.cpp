@@ -2,6 +2,8 @@
 #include "config.h"
 #include "feed_monitor.h"
 
+#include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <cstring>
@@ -17,20 +19,74 @@ namespace {
 
 FeedMonitor* g_monitor = nullptr;
 
-// Signal-safe: only touches g_monitor (a plain pointer, read-only here) and
-// calls FeedMonitor::stop(), which itself only does an atomic store and a
-// write() to an eventfd -- both on the POSIX async-signal-safe list.
+// Async-signal-safe: stop() is an atomic store plus an eventfd write(); errno is preserved.
 void handle_signal(int) {
+    const int saved_errno = errno;
     if (g_monitor != nullptr) {
         g_monitor->stop();
     }
+    errno = saved_errno;
 }
 
-// Attempts to raise RLIMIT_NOFILE to its hard limit before any feeds are
-// added -- the spec's "monitor 1000s of connections" claim would otherwise
-// silently cap out at whatever the shell's default soft limit is (often
-// 1024). Logs the effective limit either way; never fatal on its own since a
-// lower limit just means fewer feeds fit, not that the program is broken.
+// Makes a fd non-blocking and restores its flags on destruction (O_NONBLOCK is
+// shared with the parent shell via the open file description).
+class NonBlockingGuard {
+public:
+    explicit NonBlockingGuard(int fd) : fd_(fd) {
+        const int flags = ::fcntl(fd_, F_GETFL, 0);
+        if (flags < 0) {
+            std::cerr << "[feed_monitor] fcntl(F_GETFL) failed: " << std::strerror(errno) << "\n";
+            return;
+        }
+        if ((flags & O_NONBLOCK) == 0 && ::fcntl(fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
+            std::cerr << "[feed_monitor] fcntl(F_SETFL, O_NONBLOCK) failed: " << std::strerror(errno) << "\n";
+            return;
+        }
+        original_flags_ = (flags & O_NONBLOCK) == 0 ? flags : -1;  // already non-blocking: nothing to restore
+        ok_ = true;
+    }
+    ~NonBlockingGuard() {
+        if (original_flags_ >= 0) {
+            ::fcntl(fd_, F_SETFL, original_flags_);
+        }
+    }
+    NonBlockingGuard(const NonBlockingGuard&) = delete;
+    NonBlockingGuard& operator=(const NonBlockingGuard&) = delete;
+
+    bool ok() const noexcept { return ok_; }
+
+private:
+    int fd_;
+    int original_flags_ = -1;
+    bool ok_ = false;
+};
+
+// Parses exactly one whole decimal argument of type T from iss; prints an error
+// and returns false if it is missing, malformed, out of range, or followed by extras.
+template <typename T>
+bool parse_single_arg(std::istringstream& iss, const std::string& cmd, const char* usage, T& out) {
+    std::string token;
+    if (!(iss >> token)) {
+        std::cerr << "usage: " << usage << "\n";
+        return false;
+    }
+    const char* first = token.data();
+    const char* last = first + token.size();
+    const auto [ptr, ec] = std::from_chars(first, last, out);
+    if (ec != std::errc{} || ptr != last) {
+        std::cerr << "[feed_monitor] " << cmd << ": invalid argument '" << token << "' (usage: " << usage << ")\n";
+        return false;
+    }
+    std::string extra;
+    if (iss >> extra) {
+        std::cerr << "[feed_monitor] " << cmd << ": unexpected extra argument '" << extra << "' (usage: " << usage
+                  << ")\n";
+        return false;
+    }
+    return true;
+}
+
+// Raises RLIMIT_NOFILE to the hard limit so thousands of feeds fit; logs the result.
 void raise_fd_limit() {
     rlimit limit{};
     if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) {
@@ -46,10 +102,7 @@ void raise_fd_limit() {
     std::cerr << "[feed_monitor] fd limit: soft=" << limit.rlim_cur << " hard=" << limit.rlim_max << "\n";
 }
 
-// Parses and dispatches one stdin command line. Runs on the reactor thread
-// (invoked from FeedMonitor's command-input callback, itself called from
-// inside run()'s event loop), so calling monitor's mutating methods here is
-// not a cross-thread concern -- see feed_monitor.h's set_command_input.
+// Parses and dispatches one stdin command (runs on the reactor thread).
 void handle_command_line(FeedMonitor& monitor, const std::string& line) {
     std::istringstream iss(line);
     std::string cmd;
@@ -62,31 +115,27 @@ void handle_command_line(FeedMonitor& monitor, const std::string& line) {
         monitor.stop();
     } else if (cmd == "disconnect") {
         uint32_t feed_id;
-        if (iss >> feed_id) {
+        if (parse_single_arg(iss, cmd, "disconnect <feed_id>", feed_id)) {
             monitor.force_disconnect(feed_id);
-        } else {
-            std::cerr << "usage: disconnect <feed_id>\n";
         }
     } else if (cmd == "reconnect") {
         uint32_t feed_id;
-        if (iss >> feed_id) {
+        if (parse_single_arg(iss, cmd, "reconnect <feed_id>", feed_id)) {
             monitor.force_reconnect(feed_id);
-        } else {
-            std::cerr << "usage: reconnect <feed_id>\n";
         }
     } else if (cmd == "set-interval") {
-        int ms;
-        if (iss >> ms) {
-            monitor.set_heartbeat_interval(std::chrono::milliseconds(ms));
-        } else {
-            std::cerr << "usage: set-interval <ms>\n";
+        int64_t ms;
+        if (parse_single_arg(iss, cmd, "set-interval <ms>", ms)) {
+            if (!monitor.set_heartbeat_interval(std::chrono::milliseconds(ms))) {
+                std::cerr << "[feed_monitor] set-interval: <ms> must be greater than 0\n";
+            }
         }
     } else if (cmd == "set-timeout") {
-        int ms;
-        if (iss >> ms) {
-            monitor.set_heartbeat_timeout(std::chrono::milliseconds(ms));
-        } else {
-            std::cerr << "usage: set-timeout <ms>\n";
+        int64_t ms;
+        if (parse_single_arg(iss, cmd, "set-timeout <ms>", ms)) {
+            if (!monitor.set_heartbeat_timeout(std::chrono::milliseconds(ms))) {
+                std::cerr << "[feed_monitor] set-timeout: <ms> must be greater than 0\n";
+            }
         }
     } else {
         std::cerr << "[feed_monitor] unknown command '" << cmd
@@ -97,12 +146,8 @@ void handle_command_line(FeedMonitor& monitor, const std::string& line) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    // Every socket send() already passes MSG_NOSIGNAL (see connection.cpp),
-    // so this is pure defense-in-depth, not a live bug -- insurance against
-    // any write path that doesn't go through that flag (stdout/stderr piped
-    // to something that closes early, or a future send() call someone adds
-    // without remembering it).
-    (void)::signal(SIGPIPE, SIG_IGN);  // return value (previous handler) deliberately unused
+    // Defense in depth: socket sends already use MSG_NOSIGNAL.
+    (void)::signal(SIGPIPE, SIG_IGN);
 
     Config config = apply_cli_overrides(Config{}, argc, argv);
     if (config.help_requested) {
@@ -117,11 +162,8 @@ int main(int argc, char** argv) {
 
     raise_fd_limit();
 
-    // FeedMonitor's command-input reader requires a non-blocking fd (see
-    // on_command_fd_readable's drain-to-EAGAIN loop); stdin is blocking by
-    // default.
-    const int stdin_flags = ::fcntl(STDIN_FILENO, F_GETFL, 0);
-    ::fcntl(STDIN_FILENO, F_SETFL, stdin_flags | O_NONBLOCK);
+    // The command reader requires non-blocking stdin; restored when main() returns.
+    NonBlockingGuard stdin_guard(STDIN_FILENO);
 
     try {
         FeedMonitor monitor(config);
@@ -142,10 +184,16 @@ int main(int argc, char** argv) {
         }
 
         monitor.set_tick_callback([](const AggregateStats& stats) { cli_display::render(stats); });
-        monitor.set_command_input(
-            STDIN_FILENO, [&monitor](const std::string& line) { handle_command_line(monitor, line); });
+        monitor.set_alert_callback([](const std::string& message) { cli_display::add_alert(message); });
+        if (!stdin_guard.ok() ||
+            !monitor.set_command_input(STDIN_FILENO, [&monitor](const std::string& line) {
+                handle_command_line(monitor, line);
+            })) {
+            std::cerr << "[feed_monitor] stdin commands unavailable; stop with SIGINT/SIGTERM\n";
+        }
 
         monitor.run();
+        g_monitor = nullptr;  // monitor is about to be destroyed
         std::cout << "[feed_monitor] shut down\n";
     } catch (const std::exception& e) {
         std::cerr << "[feed_monitor] fatal: " << e.what() << "\n";

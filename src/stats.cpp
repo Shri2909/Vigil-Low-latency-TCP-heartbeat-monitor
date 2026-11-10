@@ -1,7 +1,13 @@
 #include "stats.h"
 
+#include <cmath>
+
 double percentile(const std::vector<int64_t>& sorted_samples, double p) {
     if (sorted_samples.empty()) {
+        return 0.0;
+    }
+    if (std::isnan(p)) {
+        // Casting a NaN rank to size_t below would be UB.
         return 0.0;
     }
     if (p <= 0.0) {

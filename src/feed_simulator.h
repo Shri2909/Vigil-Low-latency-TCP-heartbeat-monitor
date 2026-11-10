@@ -1,36 +1,25 @@
 #pragma once
 
-// Mock exchange: an epoll reactor around a listening socket, mirroring
-// FeedMonitor's structure but using Connection in Role::kResponder mode for
-// each accepted client. Added per PROJECT_PLAN.md audit finding #1 -- without
-// this, Connection/FeedMonitor have nothing to connect to. Includes fault
-// injection (drop/latency/jitter/kill) so failure-detection and reconnect
-// logic in FeedMonitor are actually exercisable and testable, per section 6.
-//
-// Storage note: unlike FeedMonitor's connections_ (a flat std::vector, see
-// PROJECT_PLAN.md section 5 and 15), clients_ here is an
-// unordered_map<int, Connection>. That's a deliberate *different* choice for
-// a deliberately different access pattern: FeedMonitor runs a periodic full
-// scan over every connection every tick (send_ping + check_timeout), which is
-// exactly the cache-locality-sensitive case the flat vector was for.
-// FeedSimulator has no such scan -- Role::kResponder's check_timeout is a
-// no-op and it never sends pings -- its only access pattern is "an epoll
-// event carries an fd, look up the Connection for it," which is precisely
-// what a hash map is for. Applying the flat-vector trick here would just
-// reintroduce a fd-to-index map to get back point lookups, for no benefit.
+// Mock exchange: an epoll reactor around a listening socket that serves each
+// client with a Connection in Role::kResponder, plus fault injection
+// (drop/latency/jitter/kill) to exercise FeedMonitor's failure handling.
+// clients_ is a hash map (point lookup by event fd), unlike FeedMonitor's flat
+// vector which is scanned in full every tick.
 
 #include "config.h"
 #include "connection.h"
 #include "unique_fd.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <random>
 #include <string>
-#include <sys/epoll.h>
 #include <unordered_map>
 #include <vector>
+
+#include <sys/epoll.h>
 
 struct FaultConfig {
     double drop_probability = 0.0;               // [0,1]; probability a PONG reply is silently not sent
@@ -38,53 +27,49 @@ struct FaultConfig {
     bool jitter = false;                          // randomize extra_latency in [0.5x, 1.5x] when > 0
 };
 
+// Listener knobs. Defaults are safe: loopback only and a bounded client count.
+struct SimulatorOptions {
+    std::string bind_address = "127.0.0.1";  // dotted-quad IPv4; "0.0.0.0" to listen on every interface
+    size_t max_clients = 1024;               // accepts beyond this are closed immediately
+};
+
 class FeedSimulator {
 public:
-    // port == 0 binds an OS-assigned ephemeral port (see port()) -- used by
-    // tests; a real deployment passes a fixed port. Throws std::runtime_error
-    // if socket setup fails (system-boundary failure, not a content one).
-    FeedSimulator(uint16_t port, uint32_t feed_id, Config config, FaultConfig faults = {});
+    // port == 0 binds an OS-assigned ephemeral port (see port()). Throws
+    // std::runtime_error if socket setup fails or bind_address is not IPv4.
+    FeedSimulator(uint16_t port, uint32_t feed_id, Config config, FaultConfig faults = {},
+                  const SimulatorOptions& options = {});
 
     FeedSimulator(const FeedSimulator&) = delete;
     FeedSimulator& operator=(const FeedSimulator&) = delete;
 
     uint16_t port() const noexcept { return bound_port_; }
     size_t client_count() const noexcept { return clients_.size(); }
+    // Deferred (extra_latency) replies currently queued. Reactor thread only.
+    size_t pending_reply_count() const noexcept { return pending_replies_.size(); }
 
-    void run();   // blocks until stop() is called
+    // Blocks until stop(); a stop() issued before run() is honored. On return,
+    // best-effort sends DISCONNECT to every client.
+    void run();
     void stop();  // safe to call from another thread or a signal handler
 
-    // Safe to call from the reactor thread only (e.g. from a command-input
-    // callback, or before run() starts) -- same rule as FeedMonitor's
-    // non-stop() methods; faults_/clients_ have no internal synchronization.
+    // Reactor thread only (e.g. a command callback, or before run()).
     void set_fault_config(FaultConfig faults);
 
-    // Picks one connected client at random and closes it with SO_LINGER{1,0}
-    // set first, so the close sends a raw RST instead of a graceful FIN --
-    // more realistic for "the exchange abruptly crashed" than a clean
-    // shutdown, and it exercises the monitor's ECONNRESET path specifically,
-    // not just the "peer closed" EOF path FeedSimulator's normal disconnects
-    // already cover. No-op if there are no clients.
+    // Closes a random client with SO_LINGER{1,0} so it sees a RST (abrupt crash,
+    // ECONNRESET path) rather than a FIN. No-op if there are no clients.
     void kill_random_connection();
 
-    // Registers fd (e.g. STDIN_FILENO) into this same epoll set for simple
-    // operator commands ("kill", "set-drop-rate 0.5", "quit"); mirrors
-    // FeedMonitor::set_command_input for the same reasons (see feed_monitor.h).
-    //
-    // PRECONDITION: fd must already be non-blocking (O_NONBLOCK) -- see the
-    // detailed reasoning on FeedMonitor::set_command_input; the failure mode
-    // (the reactor thread freezes on every client, not just this fd) is
-    // identical here. A pipe's default is blocking and pipe(2) has no
-    // equivalent of SOCK_NONBLOCK, so a test feeding one via a pipe must
-    // fcntl() it explicitly, same as main_simulator.cpp does for stdin.
+    // Watches fd (e.g. STDIN_FILENO) for line commands. PRECONDITION: fd must
+    // already be O_NONBLOCK, or a blocking read stalls the whole reactor.
     using CommandLineCallback = std::function<void(const std::string& line)>;
     void set_command_input(int fd, CommandLineCallback on_line);
 
-    // How large command_line_buffer_ is allowed to grow while waiting for a
-    // '\n' before its contents are discarded (see the warning logged in
-    // on_command_fd_readable). Public so tests can exercise the boundary
-    // without duplicating the constant.
-    static constexpr size_t kMaxCommandLineBufferBytes = 64 * 1024;
+    // Max bytes buffered while waiting for '\n' before the line is discarded.
+    static constexpr size_t kMaxCommandLineBufferBytes = size_t{64} * 1024;
+
+    // Cap on queued deferred replies; excess is dropped (looks like injected loss).
+    static constexpr size_t kMaxPendingReplies = 4096;
 
 private:
     struct PendingReply {
@@ -94,21 +79,27 @@ private:
         int64_t timestamp_ns;
     };
 
-    void accept_new_connections(int64_t now_ns);
+    void accept_new_connections();
     void handle_client_event(int fd, uint32_t events, int64_t now_ns);
     void remove_client(int fd);
     void sync_epoll_interest(int fd, Connection& conn);
     void on_timer_tick();
     void on_command_fd_readable();
-    // Called synchronously from within a client Connection's handle_ping via
-    // set_ping_interceptor; returns false to suppress the automatic reply
-    // (either dropping it for good, or scheduling a deferred send_pong()).
+    void process_command_buffer();
+    void close_command_input();
+    void disarm_listener();
+    void send_disconnect_to_all();
+    // Connection ping interceptor: returns false to suppress the automatic
+    // reply (dropped, or deferred via pending_replies_).
     bool on_ping_intercept(int fd, uint64_t sequence, int64_t timestamp_ns);
 
     UniqueFd listen_fd_;
     UniqueFd epoll_fd_;
     UniqueFd wake_fd_;
     UniqueFd timer_fd_;
+    // Reserved /dev/null fd, released to shed a connection on EMFILE/ENFILE.
+    UniqueFd spare_fd_;
+    bool listener_disarmed_ = false;  // set by disarm_listener(), cleared by the next tick
     uint16_t bound_port_ = 0;
     uint32_t feed_id_;
     Config config_;
@@ -118,7 +109,12 @@ private:
     std::vector<PendingReply> pending_replies_;
     int command_fd_ = -1;
     std::string command_line_buffer_;
+    bool discarding_oversized_line_ = false;  // dropping the tail of an over-long line up to its '\n'
+    size_t max_clients_;
     CommandLineCallback on_command_line_;
     std::atomic<bool> stop_requested_{false};
     std::vector<epoll_event> event_batch_;
+    // fds closed during the current epoll batch. Later events in the batch for
+    // these numbers are stale (the fd may already be reused by a new client).
+    std::vector<int> removed_in_batch_;
 };

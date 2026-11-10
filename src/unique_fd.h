@@ -1,13 +1,6 @@
 #pragma once
 
-// Move-only RAII file descriptor. Added while building Connection: a class
-// storing a raw `int fd_` cannot be safely moved by the compiler-generated
-// (or `= default`ed) move constructor -- a plain member-wise move copies the
-// int without invalidating the source, so both the moved-from and moved-to
-// objects would close() the same fd on destruction. That matters here
-// specifically because Connection is stored by value in a std::vector (see
-// PROJECT_PLAN.md section 5's flat-vector amendment), so it must be safely
-// movable for reallocation/erase to work correctly.
+// Move-only RAII file descriptor (Connection is stored by value in a std::vector, so it must be safely movable).
 
 #include <unistd.h>
 

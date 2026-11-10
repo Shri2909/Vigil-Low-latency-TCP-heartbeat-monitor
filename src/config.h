@@ -1,9 +1,6 @@
 #pragma once
 
-// Configuration: defaults, config-file parsing, and CLI overrides.
-// See PROJECT_PLAN.md section 8. No parser dependency -- both the file format
-// and the CLI flags are hand-rolled (key=value + repeated [feed] sections;
-// getopt_long for the CLI).
+// Configuration: built-in defaults, a key=value config file with [feed] sections, and CLI overrides.
 
 #include <chrono>
 #include <cstdint>
@@ -32,29 +29,18 @@ struct Config {
     bool edge_triggered = true;
 
     std::vector<FeedEndpoint> feeds;
-    std::string log_level = "info";  // trace|debug|info|warn|error
 
-    // Set by apply_cli_overrides when -h/--help is present. Not read back from
-    // a config file. Kept on Config (rather than a bare exit() call inside the
-    // parser) so parsing stays a pure function main.cpp can act on -- important
-    // for testability, since config_test.cpp calls apply_cli_overrides directly
-    // and must never have it terminate the test process.
+    // Set by apply_cli_overrides on -h/--help (never read from a file); the caller acts on it.
     bool help_requested = false;
 };
 
-// Parses a key=value config file with repeated [feed] sections (format
-// documented in PROJECT_PLAN.md section 8). Malformed lines, unknown keys, and
-// invalid values are logged to stderr and skipped -- one bad line never aborts
-// the rest of the file. Only a file that can't be opened throws
-// (std::runtime_error): that's a system-boundary failure, not a content one.
+// Parses a config file. Bad lines, unknown keys and out-of-range values are warned about and skipped
+// (default kept); cross-field violations revert the pair to defaults. Throws std::runtime_error only
+// if the file cannot be opened or read.
 Config parse_config_file(const std::string& path);
 
-// Applies CLI flags on top of base. If argv contains --config <path>, that
-// file is loaded first (via parse_config_file) and used as the new base before
-// the remaining flags are applied -- so precedence is: CLI flags > --config
-// file > base's built-in defaults. Never calls exit()/throws for bad flags;
-// unrecognized or malformed flags are logged to stderr and ignored, matching
-// the config-file parser's "never abort on bad input" policy.
+// Applies CLI flags on top of base. Precedence: CLI flags > --config file > base. Bad flags are
+// warned about and ignored; never throws or exits.
 Config apply_cli_overrides(Config base, int argc, char** argv);
 
 void print_usage(const char* prog_name);

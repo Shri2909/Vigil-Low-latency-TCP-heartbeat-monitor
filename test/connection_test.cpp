@@ -1,15 +1,16 @@
-// Connection is tested against a minimal raw-socket TCP peer written directly
-// in this file, not against FeedSimulator (which doesn't exist yet -- and
-// even once it does, is itself built *from* Connection, so testing Connection
-// against it would be circular; see PROJECT_PLAN.md section 10/15).
+// Connection is tested against a minimal raw-socket peer defined in this file rather than
+// FeedSimulator, which is itself built on Connection (that would be circular).
 
 #include "connection.h"
+#include "epoll_utils.h"
 #include "time_utils.h"
 #include "heartbeat.h"
 #include "mini_test.h"
 
 #include <cerrno>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 
 namespace {
@@ -36,9 +38,7 @@ bool wait_for(int fd, short events, int timeout_ms) {
 bool wait_readable(int fd, int timeout_ms = 1000) { return wait_for(fd, POLLIN, timeout_ms); }
 bool wait_writable(int fd, int timeout_ms = 1000) { return wait_for(fd, POLLOUT, timeout_ms); }
 
-// A blocking TCP listener representing "the other side" of whatever
-// Connection under test is exercising. Owns exactly one accepted peer socket
-// at a time, which is all these tests need.
+// Blocking loopback listener acting as the remote side; owns one accepted peer socket.
 class TestPeerListener {
 public:
     TestPeerListener() {
@@ -64,16 +64,12 @@ public:
 
     uint16_t port() const { return port_; }
 
-    // Blocks (briefly -- loopback, test-local) until a client connects.
     int accept_one() {
         peer_fd_ = ::accept(listen_fd_, nullptr, nullptr);
         return peer_fd_;
     }
 
-    // Same contract as UniqueFd::release(): hands ownership of the accepted
-    // fd back to the caller, so this class's destructor won't also close it.
-    // Needed by any test that deliberately closes the peer fd mid-test (e.g.
-    // to trigger an EOF scenario) rather than leaving cleanup to RAII.
+    // Hands ownership of the accepted fd to the caller (for tests that close it mid-test).
     int release_peer_fd() {
         const int fd = peer_fd_;
         peer_fd_ = -1;
@@ -86,9 +82,7 @@ private:
     uint16_t port_ = 0;
 };
 
-// Non-blocking client socket connect()ed toward the given port, returned
-// immediately (likely EINPROGRESS) -- exactly the state Connection expects to
-// be constructed with for Role::kInitiator.
+// Non-blocking socket with connect() issued (likely EINPROGRESS): what a kInitiator expects.
 int connect_nonblocking(uint16_t port) {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     set_nonblocking(fd);
@@ -111,9 +105,7 @@ void send_wire(int fd, const HeartbeatMessage& msg) {
     }
 }
 
-// Reads exactly kHeartbeatMessageSize bytes (blocking on a short timeout) and
-// decodes them. REQUIREs success -- a test that expects no message should not
-// call this.
+// Reads and decodes exactly one message; REQUIREs success.
 HeartbeatMessage recv_wire(int fd) {
     HeartbeatWireBuffer wire{};
     size_t total = 0;
@@ -137,9 +129,16 @@ Config make_test_config() {
     return config;
 }
 
-// Drives a fresh Role::kInitiator Connection through connect + handshake
-// against `peer`, leaving both the Connection and the raw peer_fd in
-// kHealthy/handshake-complete state. Returns the peer's accepted fd.
+HeartbeatMessage make_msg(MessageType type, uint32_t feed_id, uint64_t sequence = 0, int64_t timestamp_ns = 0) {
+    HeartbeatMessage msg{};
+    msg.type = static_cast<uint8_t>(type);
+    msg.feed_id = feed_id;
+    msg.sequence = sequence;
+    msg.timestamp_ns = timestamp_ns;
+    return msg;
+}
+
+// A kInitiator Connection driven through connect + handshake to kHealthy against a raw peer.
 struct InitiatorFixture {
     TestPeerListener peer;
     Config config = make_test_config();
@@ -168,13 +167,55 @@ struct InitiatorFixture {
     }
 };
 
+// A kResponder Connection (feed 7) with `client_fd` as the raw peer; optionally completes the handshake.
+struct ResponderFixture {
+    TestPeerListener peer;
+    Config config = make_test_config();
+    int client_fd;
+    int accepted_fd;
+    Connection responder;
+
+    explicit ResponderFixture(bool handshake)
+        : client_fd(connect_nonblocking(peer.port())),
+          accepted_fd(setup_accepted(peer)),
+          responder(accepted_fd, Role::kResponder, /*feed_id=*/7, "127.0.0.1", peer.port(), config) {
+        if (handshake) {
+            send_wire(client_fd, make_msg(MessageType::kConnectHello, 7));
+            REQUIRE(wait_readable(accepted_fd));
+            responder.on_readable(1'000);
+            REQUIRE(responder.state() == ConnectionState::kHealthy);
+            recv_wire(client_fd);  // drain the CONNECT_ACK
+        }
+    }
+    ~ResponderFixture() { ::close(client_fd); }
+
+    // Sends `msg` from the peer and lets the responder process it.
+    void deliver(const HeartbeatMessage& msg, int64_t now_ns = 2'000) {
+        send_wire(client_fd, msg);
+        REQUIRE(wait_readable(accepted_fd));
+        responder.on_readable(now_ns);
+    }
+
+private:
+    static int setup_accepted(TestPeerListener& peer) {
+        const int fd = peer.accept_one();
+        set_nonblocking(fd);
+        return fd;
+    }
+};
+
+// Delivers `msg` from the peer to the initiator's Connection and runs on_readable.
+void deliver_to_initiator(InitiatorFixture& fx, const HeartbeatMessage& msg, int64_t now_ns) {
+    send_wire(fx.peer_fd, msg);
+    REQUIRE(wait_readable(fx.client_fd));
+    fx.connection.on_readable(now_ns);
+}
+
 }  // namespace
 
 TEST_CASE("initiator reaches HEALTHY after CONNECT_HELLO/CONNECT_ACK handshake") {
     InitiatorFixture fx;
     CHECK(fx.connection.state() == ConnectionState::kHealthy);
-    // handshake completed via on_readable(2'000) in the fixture -- see
-    // handle_connect_ack, which stamps connected_since_ns there.
     CHECK(fx.connection.stats().connected_since_ns == 2'000);
 }
 
@@ -217,16 +258,7 @@ TEST_CASE("valid PONG updates RTT stats and clears missed-count") {
 }
 
 TEST_CASE("a final PONG arriving in the same on_readable call as peer EOF is still processed") {
-    // Regression test for a real bug: on_readable used to call
-    // handle_peer_closed() and return immediately on recv()==0 (EOF), before
-    // ever draining whatever had just been accumulated into read_accum_ in
-    // that same call -- silently dropping an already-fully-received final
-    // message. Reproduced by having the peer send a PONG and close
-    // immediately with no delay, so both the data and the EOF are visible to
-    // a single on_readable() call (this is exactly what happens in practice
-    // when a fault-injected deferred PONG is immediately followed by the
-    // peer disconnecting, or on any graceful shutdown that sends a last
-    // message before closing).
+    // The peer sends a PONG and closes at once, so data and EOF are both visible to one on_readable().
     InitiatorFixture fx;
 
     fx.connection.send_ping(1'000);
@@ -249,15 +281,7 @@ TEST_CASE("a final PONG arriving in the same on_readable call as peer EOF is sti
 }
 
 TEST_CASE("a reordered PONG (earlier sequence arriving after a later one) is still counted, not dropped as stale") {
-    // Regression test for a real bug: handle_pong used to compare
-    // msg.sequence against "the highest sequence acked so far" and drop
-    // anything <= that as stale/duplicate. But set_ping_interceptor (built
-    // for FeedSimulator's extra_latency fault injection) explicitly allows
-    // deferring an earlier PING's reply behind a later one's, so PONGs do
-    // not always arrive in non-decreasing sequence order -- a legitimate
-    // reordered PONG was silently misclassified as stale and dropped.
-    // Reproduced directly here (no simulator/fault-injection needed): send
-    // two pings, then feed their PONGs back in reverse order.
+    // Send two pings, then return their PONGs in reverse order.
     InitiatorFixture fx;
 
     fx.connection.send_ping(1'000);  // sequence 0
@@ -275,7 +299,7 @@ TEST_CASE("a reordered PONG (earlier sequence arriving after a later one) is sti
     fx.connection.on_readable(2'300);
     CHECK(fx.connection.stats().heartbeats_acked == 1u);
 
-    // Now the *earlier* sequence's (deferred) PONG arrives, out of order.
+    // The earlier sequence arrives late.
     HeartbeatMessage pong0{};
     pong0.type = static_cast<uint8_t>(MessageType::kPong);
     pong0.feed_id = 42;
@@ -293,11 +317,7 @@ TEST_CASE("N consecutive missed heartbeats transitions HEALTHY -> DEGRADED -> FA
     fx.config.max_missed_heartbeats = 2;
     const int64_t timeout_ns = 3'000'000'000LL;  // matches make_test_config()'s 3000ms
 
-    // InitiatorFixture's handshake completes via on_readable(2'000), which sets
-    // last_liveness_ns_ = 2000 -- start from that same baseline, not an
-    // independent guess, or "elapsed" comes out short.
-    int64_t t = 2'000;
-    // Advance strictly past the timeout window each call -- injected time, no real sleeping.
+    int64_t t = 2'000;  // the fixture's handshake time is the liveness baseline
     t += timeout_ns + 1;
     CHECK(fx.connection.check_timeout(t) == false);
     CHECK(fx.connection.state() == ConnectionState::kDegraded);
@@ -308,16 +328,6 @@ TEST_CASE("N consecutive missed heartbeats transitions HEALTHY -> DEGRADED -> FA
 }
 
 TEST_CASE("a PONG whose round trip already exceeds heartbeat_timeout does not resurrect a degraded connection") {
-    // Regression test for a real gap: handle_pong only checked "have I
-    // already counted this sequence," never "did this reply arrive within a
-    // timeframe that actually proves current health." A PONG for a PING
-    // sent long enough ago that its round trip already exceeds
-    // heartbeat_timeout doesn't prove the feed is healthy *now* -- by the
-    // same timing rule check_timeout itself uses to declare a miss, this
-    // reply is already too old to trust. Before the fix, accepting it would
-    // reset consecutive_missed_ to 0 and flip a kDegraded connection
-    // straight back to kHealthy, silently masking every real miss that
-    // happened after the stale PING was originally sent.
     InitiatorFixture fx;
     const int64_t timeout_ns = 3'000'000'000LL;  // matches make_test_config()'s 3000ms
 
@@ -325,14 +335,12 @@ TEST_CASE("a PONG whose round trip already exceeds heartbeat_timeout does not re
     const HeartbeatMessage ping = recv_wire(fx.peer_fd);
     REQUIRE(ping.sequence == 0u);
 
-    // No reply arrives in time -> one miss, DEGRADED (make_test_config()'s
-    // max_missed_heartbeats=3, so this single miss alone doesn't fail it).
+    // No reply in time: one miss -> DEGRADED (max_missed_heartbeats is 3).
     int64_t t = 2'000 + timeout_ns + 1;
     CHECK(fx.connection.check_timeout(t) == false);
     CHECK(fx.connection.state() == ConnectionState::kDegraded);
 
-    // The PONG for that very first PING finally arrives -- but its implied
-    // RTT (t - ping.timestamp_ns) is already well past heartbeat_timeout.
+    // The PONG finally arrives, but its RTT already exceeds heartbeat_timeout.
     HeartbeatMessage pong{};
     pong.type = static_cast<uint8_t>(MessageType::kPong);
     pong.feed_id = 42;
@@ -348,34 +356,29 @@ TEST_CASE("a PONG whose round trip already exceeds heartbeat_timeout does not re
 }
 
 TEST_CASE("a PONG with a future timestamp is not accepted as a valid heartbeat") {
-    // Regression test: handle_pong's staleness check only rejected RTTs that
-    // were too *large* (rtt_ns >= heartbeat_timeout), never negative ones. A
-    // PONG whose echoed timestamp_ns claims to be in the future relative to
-    // now_ns (clock skew, a buggy peer, or a forged message) produced a
-    // negative rtt_ns that slipped straight through -- accepted as a valid
-    // heartbeat, incrementing heartbeats_acked and polluting
-    // stats().last_rtt_ns/ewma_rtt_ns with a nonsensical negative value.
-    // Verified empirically before this fix: last_rtt_ns came out as
-    // -999999999998 for a PONG claiming a timestamp ~1000s in the future.
     InitiatorFixture fx;
+    fx.connection.send_ping(2'000);  // sequence 0 must exist for its PONG to be plausible
+    recv_wire(fx.peer_fd);
 
     HeartbeatMessage pong{};
     pong.type = static_cast<uint8_t>(MessageType::kPong);
     pong.feed_id = 42;
     pong.sequence = 0;
-    pong.timestamp_ns = 999'999'999'999LL;  // far in the "future" relative to the on_readable() call below
+    pong.timestamp_ns = 999'999'999'999LL;  // far in the future relative to the on_readable() below
     send_wire(fx.peer_fd, pong);
 
     REQUIRE(wait_readable(fx.client_fd));
-    fx.connection.on_readable(2'001);  // now_ns barely after handshake -- nowhere near the claimed timestamp
+    fx.connection.on_readable(2'001);
 
     CHECK(fx.connection.stats().heartbeats_acked == 0u);
     CHECK(fx.connection.stats().last_rtt_ns == 0);
-    CHECK(fx.connection.state() == ConnectionState::kHealthy);  // unaffected either way, just not counted
+    CHECK(fx.connection.state() == ConnectionState::kHealthy);
 }
 
 TEST_CASE("a message split across two on_readable calls reassembles correctly") {
     InitiatorFixture fx;
+    fx.connection.send_ping(1'000);
+    recv_wire(fx.peer_fd);
 
     HeartbeatMessage pong{};
     pong.type = static_cast<uint8_t>(MessageType::kPong);
@@ -385,12 +388,11 @@ TEST_CASE("a message split across two on_readable calls reassembles correctly") 
     HeartbeatWireBuffer wire;
     encode_heartbeat(pong, wire);
 
-    // send the first half, let the Connection see it, then the second half.
     ssize_t n = ::send(fx.peer_fd, wire.data(), 10, 0);
     REQUIRE(n == 10);
     REQUIRE(wait_readable(fx.client_fd));
     fx.connection.on_readable(5'000);
-    CHECK(fx.connection.stats().heartbeats_acked == 0u);  // nothing to parse yet -- only 10/28 bytes arrived
+    CHECK(fx.connection.stats().heartbeats_acked == 0u);  // only 10/28 bytes so far
 
     n = ::send(fx.peer_fd, wire.data() + 10, wire.size() - 10, 0);
     REQUIRE(n == static_cast<ssize_t>(wire.size() - 10));
@@ -402,9 +404,7 @@ TEST_CASE("a message split across two on_readable calls reassembles correctly") 
 TEST_CASE("write_pending_ queues under a full send buffer and flushes on the next writable event") {
     InitiatorFixture fx;
 
-    // Shrink the client's send buffer so a burst of pings can't all fit in the
-    // kernel socket buffer at once, forcing queue_write's immediate-send
-    // attempt to short-write and leave bytes in write_pending_.
+    // A tiny send buffer forces short writes, leaving bytes queued.
     int small_buf = 256;
     ::setsockopt(fx.client_fd, SOL_SOCKET, SO_SNDBUF, &small_buf, sizeof(small_buf));
 
@@ -417,8 +417,6 @@ TEST_CASE("write_pending_ queues under a full send buffer and flushes on the nex
     }
     REQUIRE(saw_queued_write);
 
-    // Drain everything the peer received so far, then let the Connection
-    // finish flushing once the socket is writable again.
     uint8_t drain_buf[65536];
     while (wait_readable(fx.peer_fd, 100)) {
         ::recv(fx.peer_fd, drain_buf, sizeof(drain_buf), 0);
@@ -429,18 +427,12 @@ TEST_CASE("write_pending_ queues under a full send buffer and flushes on the nex
 }
 
 TEST_CASE("write_pending_ exceeding the cap fails the connection instead of growing forever") {
-    // Regression test: a peer that stops reading (wedged, slow-loris) used
-    // to let write_pending_ grow one heartbeat's worth of bytes at a time,
-    // forever, with no drain guarantee -- unlike command_line_buffer_
-    // (capped separately), nothing bounded this. Same SO_SNDBUF-shrinking
-    // technique as the neighboring test forces real accumulation instead of
-    // the kernel silently absorbing everything.
     InitiatorFixture fx;
 
     int small_buf = 256;
     ::setsockopt(fx.client_fd, SOL_SOCKET, SO_SNDBUF, &small_buf, sizeof(small_buf));
 
-    // Never read from fx.peer_fd -- the peer intentionally never drains.
+    // fx.peer_fd is never read, so the queue backs up.
     const size_t iterations = Connection::kMaxWritePendingBytes / kHeartbeatMessageSize + 10;
     for (size_t i = 0; i < iterations && fx.connection.state() != ConnectionState::kFailed; ++i) {
         fx.connection.send_ping(static_cast<int64_t>(i));
@@ -449,45 +441,33 @@ TEST_CASE("write_pending_ exceeding the cap fails the connection instead of grow
     CHECK(fx.connection.state() == ConnectionState::kFailed);
 }
 
-TEST_CASE("read_accum_ exceeding the cap within a single on_readable() call fails the connection, even when every individual message is well-formed") {
-    // Regression test: drain_read_buffer() only runs once, after
-    // on_readable()'s recv-until-EAGAIN loop exits -- so read_accum_ isn't
-    // bounded by "steady-state leftover between calls is small" *within* one
-    // call. A peer sustaining a flood faster than the drain rate could
-    // otherwise grow it to an arbitrary size in one shot.
-    //
-    // Deliberately NOT a garbage/corrupt burst: a flood of garbage would
-    // still end up kFailed via the pre-existing corrupt-message detection
-    // once drain_read_buffer eventually ran, whether or not the cap exists
-    // -- that wouldn't actually prove the cap does anything. Instead this
-    // sends many individually well-formed, individually-acceptable PONGs
-    // (each one alone would be happily processed) -- without the cap,
-    // drain_read_buffer would eventually run and accept the entire burst,
-    // ending HEALTHY with a huge acked count; the cap must fail the
-    // connection before that ever happens, purely because of accumulated
-    // size, independent of message validity.
+TEST_CASE("a burst larger than the read cap made of valid messages is processed, not failed") {
+    // The read cap applies to the unparsed remainder, not to the size of a burst.
     InitiatorFixture fx;
 
-    // Large enough that the peer's blocking send() below completes without
-    // blocking on our end draining it -- this test controls exactly when
-    // on_readable() runs, so nothing drains the socket until then.
+    const size_t message_count = Connection::kMaxReadAccumBytes / kHeartbeatMessageSize + 10;
+    for (size_t i = 0; i < message_count; ++i) {
+        fx.connection.send_ping(900);
+        if (i % 256 == 255) {
+            uint8_t sink[16384];  // keep the peer draining
+            while (wait_readable(fx.peer_fd, 0)) ::recv(fx.peer_fd, sink, sizeof(sink), 0);
+        }
+    }
+    uint8_t sink[16384];
+    while (wait_readable(fx.peer_fd, 0)) ::recv(fx.peer_fd, sink, sizeof(sink), 0);
+    REQUIRE(fx.connection.state() == ConnectionState::kHealthy);
+
+    // Big receive buffer so the peer's blocking send() completes before on_readable() runs.
     int big_buf = 512 * 1024;
     ::setsockopt(fx.client_fd, SOL_SOCKET, SO_RCVBUF, &big_buf, sizeof(big_buf));
 
-    const size_t message_count = Connection::kMaxReadAccumBytes / kHeartbeatMessageSize + 10;
     std::vector<uint8_t> burst;
     burst.reserve(message_count * kHeartbeatMessageSize);
     for (size_t i = 0; i < message_count; ++i) {
-        HeartbeatMessage pong{};
-        pong.type = static_cast<uint8_t>(MessageType::kPong);
-        pong.feed_id = 42;
-        pong.sequence = i;
-        pong.timestamp_ns = 900;  // well within heartbeat_timeout of the on_readable() call below
         HeartbeatWireBuffer wire;
-        encode_heartbeat(pong, wire);
+        encode_heartbeat(make_msg(MessageType::kPong, 42, i, 900), wire);
         burst.insert(burst.end(), wire.begin(), wire.end());
     }
-
     size_t sent = 0;
     while (sent < burst.size()) {
         const ssize_t n = ::send(fx.peer_fd, burst.data() + sent, burst.size() - sent, 0);
@@ -495,10 +475,12 @@ TEST_CASE("read_accum_ exceeding the cap within a single on_readable() call fail
         sent += static_cast<size_t>(n);
     }
 
-    REQUIRE(wait_readable(fx.client_fd));
-    fx.connection.on_readable(1'000);
-
-    CHECK(fx.connection.state() == ConnectionState::kFailed);
+    size_t guard = 0;
+    while (fx.connection.stats().heartbeats_acked < message_count && guard++ < 1000) {
+        if (wait_readable(fx.client_fd, 10)) fx.connection.on_readable(1'000);
+    }
+    CHECK(fx.connection.state() == ConnectionState::kHealthy);
+    CHECK(fx.connection.stats().heartbeats_acked == message_count);
 }
 
 TEST_CASE("peer closing the connection transitions to FAILED") {
@@ -529,13 +511,10 @@ TEST_CASE("rebind clears per-attempt state but preserves cumulative stats") {
 
     CHECK(fx.connection.state() == ConnectionState::kConnecting);
     CHECK(fx.connection.fd() == new_client_fd);
-    // cumulative stats survive a reconnect -- only per-attempt sequence/buffer
-    // state resets.
     CHECK(fx.connection.stats().heartbeats_sent == 1u);
     CHECK(fx.connection.stats().reconnects == 1u);
-    CHECK(fx.connection.stats().connected_since_ns == 0);  // not connected again yet
+    CHECK(fx.connection.stats().connected_since_ns == 0);
 
-    // next ping after rebind starts sequence back at 0
     const int new_peer_fd = new_peer.accept_one();
     REQUIRE(wait_writable(new_client_fd));
     fx.connection.on_writable(100'100);
@@ -551,11 +530,7 @@ TEST_CASE("rebind clears per-attempt state but preserves cumulative stats") {
 
     fx.connection.send_ping(100'300);
     HeartbeatMessage ping = recv_wire(new_peer_fd);
-    CHECK(ping.sequence == 0u);  // reset, not continuing from the old connection's counter
-
-    // no explicit close(new_peer_fd) here: new_peer (TestPeerListener) already
-    // owns and closes it via RAII -- closing it again here would be a
-    // double-close on whatever fd number happens to get reused next.
+    CHECK(ping.sequence == 0u);  // sequence restarts after rebind
 }
 
 TEST_CASE("responder replies to PING with PONG echoing sequence and timestamp") {
@@ -599,18 +574,7 @@ TEST_CASE("responder replies to PING with PONG echoing sequence and timestamp") 
 }
 
 TEST_CASE("check_timeout fails a responder stuck in kHandshaking forever (no CONNECT_HELLO ever arrives)") {
-    // Regression test for F13: Role::kResponder connections used to never
-    // time out at all (check_timeout returned false unconditionally), so a
-    // client that connects and then goes silent mid-handshake would occupy a
-    // Connection+fd on FeedSimulator indefinitely -- a real, unbounded
-    // resource-exhaustion vector for a hung or malicious test client.
-    //
-    // Unlike the handshake-progressing tests elsewhere in this file, nothing
-    // here ever calls a handler with a test-controlled now_ns before this
-    // check, so state_entered_ns_ still holds whatever now_monotonic_ns()
-    // the constructor itself read -- t0 below captures that same real clock
-    // right after construction so the injected "later" timestamps are
-    // correctly relative to it, not to an arbitrary small literal.
+    // The constructor stamped state_entered_ns_ from the real clock, so injected times are relative to t0.
     TestPeerListener peer;
     Config config = make_test_config();  // heartbeat_timeout = 3000ms
     const int client_fd = connect_nonblocking(peer.port());
@@ -634,10 +598,6 @@ TEST_CASE("check_timeout fails a responder stuck in kHandshaking forever (no CON
 }
 
 TEST_CASE("check_timeout fails a healthy responder whose client stops sending PING") {
-    // Regression test for F13, the other half: a responder that completed
-    // its handshake and received at least one PING, but then the peer goes
-    // quiet (crashes without closing its socket, or is a deliberately hung
-    // test client) -- this used to be undetectable from the responder side.
     TestPeerListener peer;
     Config config = make_test_config();  // heartbeat_timeout = 3000ms
     const int client_fd = connect_nonblocking(peer.port());
@@ -667,13 +627,228 @@ TEST_CASE("check_timeout fails a healthy responder whose client stops sending PI
     const int64_t timeout_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(config.heartbeat_timeout).count();
 
-    // ...then the client goes silent. Not yet timed out shortly after the last PING.
+    // The client goes silent: not timed out shortly after the last PING...
     CHECK(responder.check_timeout(2'000 + 100) == false);
     CHECK(responder.state() == ConnectionState::kHealthy);
 
-    // Well past heartbeat_timeout with no further PING.
+    // ...but timed out once heartbeat_timeout passes with no PING.
     CHECK(responder.check_timeout(2'000 + timeout_ns + 1) == true);
     CHECK(responder.state() == ConnectionState::kFailed);
 
     ::close(client_fd);
+}
+
+// PONG validation (initiator side)
+TEST_CASE("a PONG for a sequence that was never sent fails the connection and is not recorded as acked") {
+    InitiatorFixture fx;
+    fx.connection.send_ping(1'000);  // only sequence 0 exists
+    recv_wire(fx.peer_fd);
+
+    deliver_to_initiator(fx, make_msg(MessageType::kPong, 42, /*sequence=*/5, 1'000), 1'500);
+
+    CHECK(fx.connection.state() == ConnectionState::kFailed);
+    CHECK(fx.connection.stats().heartbeats_acked == 0u);
+}
+
+TEST_CASE("a PONG with a forged extreme timestamp is ignored without overflow") {
+    // now_ns - INT64_MIN would overflow; the range check must precede the subtraction.
+    InitiatorFixture fx;
+    for (int64_t forged : {std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max(), int64_t{-1}}) {
+        fx.connection.send_ping(1'000);
+        recv_wire(fx.peer_fd);
+        const uint64_t seq = fx.connection.stats().heartbeats_sent - 1;
+        deliver_to_initiator(fx, make_msg(MessageType::kPong, 42, seq, forged), 1'500);
+        CHECK(fx.connection.state() == ConnectionState::kHealthy);
+        CHECK(fx.connection.stats().heartbeats_acked == 0u);
+        CHECK(fx.connection.stats().last_rtt_ns == 0);
+    }
+}
+
+TEST_CASE("a PONG with the wrong feed_id fails the connection") {
+    InitiatorFixture fx;
+    fx.connection.send_ping(1'000);
+    recv_wire(fx.peer_fd);
+    deliver_to_initiator(fx, make_msg(MessageType::kPong, /*feed_id=*/43, 0, 1'000), 1'500);
+    CHECK(fx.connection.state() == ConnectionState::kFailed);
+    CHECK(fx.connection.stats().heartbeats_acked == 0u);
+}
+
+TEST_CASE("a duplicate PONG is ignored and not double-counted") {
+    InitiatorFixture fx;
+    fx.connection.send_ping(1'000);
+    recv_wire(fx.peer_fd);
+    deliver_to_initiator(fx, make_msg(MessageType::kPong, 42, 0, 1'000), 1'500);
+    CHECK(fx.connection.stats().heartbeats_acked == 1u);
+    deliver_to_initiator(fx, make_msg(MessageType::kPong, 42, 0, 1'000), 1'600);
+    CHECK(fx.connection.stats().heartbeats_acked == 1u);
+    CHECK(fx.connection.state() == ConnectionState::kHealthy);  // benign, not a violation
+}
+
+TEST_CASE("an unexpected PONG (responder role, or initiator before the handshake finishes) fails the connection") {
+    {
+        ResponderFixture fx(/*handshake=*/true);
+        fx.deliver(make_msg(MessageType::kPong, 7, 0, 1'000));
+        CHECK(fx.responder.state() == ConnectionState::kFailed);
+    }
+    {
+        // initiator still in kHandshaking: connect done, CONNECT_ACK not yet received
+        TestPeerListener peer;
+        Config config = make_test_config();
+        const int client_fd = connect_nonblocking(peer.port());
+        Connection conn(client_fd, Role::kInitiator, 42, "127.0.0.1", peer.port(), config);
+        const int peer_fd = peer.accept_one();
+        REQUIRE(wait_writable(client_fd));
+        conn.on_writable(1'000);
+        REQUIRE(conn.state() == ConnectionState::kHandshaking);
+        send_wire(peer_fd, make_msg(MessageType::kPong, 42, 0, 1'000));
+        REQUIRE(wait_readable(client_fd));
+        conn.on_readable(2'000);
+        CHECK(conn.state() == ConnectionState::kFailed);
+    }
+}
+
+// Other protocol-violation paths
+TEST_CASE("a corrupt message mid-stream fails the connection, after the valid message before it was processed") {
+    InitiatorFixture fx;
+    fx.connection.send_ping(1'000);
+    recv_wire(fx.peer_fd);
+
+    HeartbeatWireBuffer good, bad;
+    encode_heartbeat(make_msg(MessageType::kPong, 42, 0, 1'000), good);
+    encode_heartbeat(make_msg(MessageType::kPong, 42, 0, 1'000), bad);
+    bad[10] ^= 0xFF;  // payload byte flipped: CRC no longer matches
+    uint8_t stream[2 * kHeartbeatMessageSize];
+    std::memcpy(stream, good.data(), good.size());
+    std::memcpy(stream + good.size(), bad.data(), bad.size());
+    REQUIRE(::send(fx.peer_fd, stream, sizeof(stream), 0) == static_cast<ssize_t>(sizeof(stream)));
+
+    REQUIRE(wait_readable(fx.client_fd));
+    fx.connection.on_readable(1'500);
+
+    CHECK(fx.connection.stats().heartbeats_acked == 1u);
+    CHECK(fx.connection.state() == ConnectionState::kFailed);
+}
+
+TEST_CASE("an incoming DISCONNECT fails the connection") {
+    InitiatorFixture fx;
+    deliver_to_initiator(fx, make_msg(MessageType::kDisconnect, 42), 3'000);
+    CHECK(fx.connection.state() == ConnectionState::kFailed);
+}
+
+TEST_CASE("unexpected CONNECT_HELLO: wrong role, repeated, or feed_id mismatch all fail the connection") {
+    {
+        InitiatorFixture fx;  // an initiator never accepts a HELLO
+        deliver_to_initiator(fx, make_msg(MessageType::kConnectHello, 42), 3'000);
+        CHECK(fx.connection.state() == ConnectionState::kFailed);
+    }
+    {
+        ResponderFixture fx(/*handshake=*/true);  // a second HELLO after the handshake
+        fx.deliver(make_msg(MessageType::kConnectHello, 7));
+        CHECK(fx.responder.state() == ConnectionState::kFailed);
+    }
+    {
+        ResponderFixture fx(/*handshake=*/false);
+        fx.deliver(make_msg(MessageType::kConnectHello, /*feed_id=*/8), 1'000);
+        CHECK(fx.responder.state() == ConnectionState::kFailed);
+    }
+}
+
+TEST_CASE("unexpected CONNECT_ACK: wrong role, repeated, or feed_id mismatch all fail the connection") {
+    {
+        ResponderFixture fx(/*handshake=*/false);  // a responder never accepts an ACK
+        fx.deliver(make_msg(MessageType::kConnectAck, 7), 1'000);
+        CHECK(fx.responder.state() == ConnectionState::kFailed);
+    }
+    {
+        InitiatorFixture fx;  // already healthy, a second ACK is a violation
+        deliver_to_initiator(fx, make_msg(MessageType::kConnectAck, 42), 3'000);
+        CHECK(fx.connection.state() == ConnectionState::kFailed);
+    }
+    {
+        TestPeerListener peer;
+        Config config = make_test_config();
+        const int client_fd = connect_nonblocking(peer.port());
+        Connection conn(client_fd, Role::kInitiator, 42, "127.0.0.1", peer.port(), config);
+        const int peer_fd = peer.accept_one();
+        REQUIRE(wait_writable(client_fd));
+        conn.on_writable(1'000);
+        send_wire(peer_fd, make_msg(MessageType::kConnectAck, /*feed_id=*/99));
+        REQUIRE(wait_readable(client_fd));
+        conn.on_readable(2'000);
+        CHECK(conn.state() == ConnectionState::kFailed);
+    }
+}
+
+TEST_CASE("unexpected PING: initiator role, responder before handshake, or feed_id mismatch fail the connection") {
+    {
+        InitiatorFixture fx;
+        deliver_to_initiator(fx, make_msg(MessageType::kPing, 42, 0, 1'000), 3'000);
+        CHECK(fx.connection.state() == ConnectionState::kFailed);
+    }
+    {
+        ResponderFixture fx(/*handshake=*/false);
+        fx.deliver(make_msg(MessageType::kPing, 7, 0, 1'000), 1'000);
+        CHECK(fx.responder.state() == ConnectionState::kFailed);
+    }
+    {
+        ResponderFixture fx(/*handshake=*/true);
+        fx.deliver(make_msg(MessageType::kPing, /*feed_id=*/8, 0, 1'000));
+        CHECK(fx.responder.state() == ConnectionState::kFailed);
+    }
+}
+
+TEST_CASE("a failing CONNECT_ACK write is not overwritten by the transition to HEALTHY") {
+    ResponderFixture fx(/*handshake=*/false);
+    send_wire(fx.client_fd, make_msg(MessageType::kConnectHello, 7));
+    REQUIRE(wait_readable(fx.accepted_fd));
+    ::shutdown(fx.accepted_fd, SHUT_WR);  // makes the ACK send() fail with EPIPE
+    fx.responder.on_readable(1'000);
+    CHECK(fx.responder.state() == ConnectionState::kFailed);
+}
+
+TEST_CASE("on_readable and on_writable are no-ops once the connection has failed") {
+    InitiatorFixture fx;
+    fx.connection.send_ping(1'000);
+    recv_wire(fx.peer_fd);
+    fx.connection.on_hangup_or_error(1'100, ECONNRESET);
+    REQUIRE(fx.connection.state() == ConnectionState::kFailed);
+
+    send_wire(fx.peer_fd, make_msg(MessageType::kPong, 42, 0, 1'000));
+    REQUIRE(wait_readable(fx.client_fd));
+    fx.connection.on_readable(1'200);
+    fx.connection.on_writable(1'300);
+
+    CHECK(fx.connection.state() == ConnectionState::kFailed);
+    CHECK(fx.connection.stats().heartbeats_acked == 0u);  // the PONG was never read
+}
+
+// epoll_utils.h
+TEST_CASE("arm_periodic_timer arms a timerfd and throws on an invalid fd") {
+    const int tfd = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    REQUIRE(tfd >= 0);
+    arm_periodic_timer(tfd, std::chrono::milliseconds(10));
+    itimerspec cur{};
+    REQUIRE(::timerfd_gettime(tfd, &cur) == 0);
+    CHECK(cur.it_interval.tv_sec == 0);
+    CHECK(cur.it_interval.tv_nsec == 10'000'000);
+    ::close(tfd);
+
+    bool threw = false;
+    try {
+        arm_periodic_timer(-1, std::chrono::milliseconds(10));
+    } catch (const std::runtime_error& e) {
+        threw = std::string(e.what()).find("timerfd_settime") != std::string::npos;
+    }
+    CHECK(threw);
+}
+
+TEST_CASE("throw_errno reports the errno that was current at the call") {
+    errno = ENOENT;
+    bool ok = false;
+    try {
+        throw_errno("open thing");
+    } catch (const std::runtime_error& e) {
+        ok = std::string(e.what()) == std::string("open thing: ") + std::strerror(ENOENT);
+    }
+    CHECK(ok);
 }

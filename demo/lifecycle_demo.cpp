@@ -1,18 +1,9 @@
-// Live demonstration of the project's actual motive: detect silent feed
-// failure, mark the connection unhealthy, stop trusting it, reconnect
-// automatically, and resume monitoring -- *without* disturbing any other
-// feed being watched at the same time. latency_bench/throughput_bench
-// (bench/) prove this is fast and scales; this proves it is *correct*, for
-// one feed failing and for its neighbors staying untouched.
-//
-// Drives a real FeedMonitor against three real FeedSimulator instances --
-// the same production classes the shipped binaries use, over real loopback
-// TCP sockets and real timers, not stubs. Only NASDAQ ever receives a fault
-// command; NYSE and LSE are never touched at all. Every line printed below
-// is triggered by an actual state transition observed on FeedMonitor's tick
-// callback; nothing here is a pre-scripted transcript.
-//
-// Usage: ./bin/lifecycle_demo
+// Live fault-injection demo: three real FeedSimulators and one real FeedMonitor
+// over loopback. Only NASDAQ is faulted; the demo checks that it fails, is
+// distrusted, reconnects and recovers while NYSE and LSE never leave HEALTHY.
+// Run: ./bin/lifecycle_demo
+// Exit: 0 = lifecycle observed and neighbors stayed healthy, 1 = a neighbor was
+// perturbed, 2 = a transition did not happen within kStateDeadline.
 
 #include "config.h"
 #include "feed_monitor.h"
@@ -22,7 +13,6 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
-#include <cstring>
 #include <ctime>
 #include <iostream>
 #include <memory>
@@ -38,9 +28,10 @@ namespace {
 
 std::mutex g_print_mutex;
 
-// Multiple threads (main() and FeedMonitor's reactor thread, via the tick
-// callback) call this, so both the shared stdout stream and the
-// non-reentrant time-formatting path need explicit protection.
+// Upper bound on any single wait; the slowest legitimate step takes ~6s.
+constexpr std::chrono::seconds kStateDeadline{30};
+
+// Called from main() and the monitor's tick callback, hence the mutex.
 void print_line(const std::string& msg) {
     std::lock_guard<std::mutex> lock(g_print_mutex);
     const auto now = std::chrono::system_clock::now();
@@ -69,10 +60,7 @@ const char* name_for(uint32_t feed_id) {
 }  // namespace
 
 int main() {
-    // Every socket send() already passes MSG_NOSIGNAL (see connection.cpp),
-    // so this is pure defense-in-depth, not a live bug -- insurance against
-    // any write path that doesn't go through that flag.
-    (void)::signal(SIGPIPE, SIG_IGN);  // return value (previous handler) deliberately unused
+    (void)::signal(SIGPIPE, SIG_IGN);  // defense in depth; sends already use MSG_NOSIGNAL
 
     std::cout << "=== Low-Latency TCP Heartbeat Monitor -- live fault-injection demonstration ===\n"
               << "Three real feeds, one real FeedMonitor -- only NASDAQ will be faulted, to\n"
@@ -85,12 +73,8 @@ int main() {
         sims.push_back(std::make_unique<FeedSimulator>(0, spec.feed_id, Config{}));
     }
 
-    // Only NASDAQ's simulator gets a command pipe for fault injection --
-    // NYSE's and LSE's simulators never receive any command at all, and
-    // their FaultConfig stays at its default (no drop, no latency) for the
-    // entire run. Same reactor-thread-only reasoning as the single-feed
-    // version: set_fault_config is called from this callback, not directly
-    // from main()'s thread.
+    // Only NASDAQ's simulator gets a command pipe; the command callback runs on
+    // its reactor thread, which is where set_fault_config must be called.
     int pipe_fds[2];
     [[maybe_unused]] const int pipe_rc = ::pipe(pipe_fds);
     const int flags = ::fcntl(pipe_fds[0], F_GETFL, 0);
@@ -113,10 +97,7 @@ int main() {
         sim_threads.emplace_back([raw] { raw->run(); });
     }
 
-    // Shipped production defaults (config.h), not a sped-up demo cadence: a
-    // sub-second miss deadline doesn't read as a believable "missed
-    // heartbeat" -- 3 seconds does. This makes the whole cycle take longer
-    // to watch, but it's the actual number a deployed instance would use.
+    // Shipped defaults rather than a sped-up cadence, so the timings are realistic.
     Config config;
     config.heartbeat_interval = std::chrono::milliseconds(1000);
     config.heartbeat_timeout = std::chrono::milliseconds(3000);
@@ -132,6 +113,9 @@ int main() {
     for (auto& s : current_state) {
         s.store(ConnectionState::kDisconnected, std::memory_order_relaxed);
     }
+    // A neighbor only counts as perturbed after it has been HEALTHY once; the
+    // initial connect is legitimately CONNECTING/HANDSHAKING.
+    std::array<std::atomic<bool>, 4> was_healthy{};
     std::atomic<bool> others_ever_left_healthy{false};
 
     monitor.set_tick_callback([&](const AggregateStats& stats) {
@@ -142,10 +126,13 @@ int main() {
                 if (f.feed_id == 1 && f.state == ConnectionState::kFailed) {
                     print_line("Reconnect attempt scheduled (exponential backoff + jitter)");
                 }
-                if (f.feed_id != 1 && f.state != ConnectionState::kHealthy) {
-                    // Would mean NYSE or LSE got disturbed by NASDAQ's fault
-                    // -- the isolation claim this demo exists to check.
-                    others_ever_left_healthy.store(true, std::memory_order_relaxed);
+                if (f.feed_id != 1) {
+                    if (f.state == ConnectionState::kHealthy) {
+                        was_healthy[f.feed_id].store(true, std::memory_order_relaxed);
+                    } else if (was_healthy[f.feed_id].load(std::memory_order_relaxed)) {
+                        // A neighbor left HEALTHY: isolation violated.
+                        others_ever_left_healthy.store(true, std::memory_order_relaxed);
+                    }
                 }
             }
         }
@@ -156,43 +143,61 @@ int main() {
     }
     std::thread monitor_thread([&monitor] { monitor.run(); });
 
+    // Returns false (after printing why) if `target` isn't reached in time.
     auto wait_for_state = [&](uint32_t feed_id, ConnectionState target) {
+        const auto deadline = std::chrono::steady_clock::now() + kStateDeadline;
         while (current_state[feed_id].load(std::memory_order_relaxed) != target) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                print_line(std::string("TIMEOUT: ") + name_for(feed_id) + " did not reach " + to_string(target) +
+                           " within " + std::to_string(kStateDeadline.count()) + "s (stuck in " +
+                           to_string(current_state[feed_id].load(std::memory_order_relaxed)) + ")");
+                return false;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
+        return true;
     };
 
-    wait_for_state(1, ConnectionState::kHealthy);
-    wait_for_state(2, ConnectionState::kHealthy);
-    wait_for_state(3, ConnectionState::kHealthy);
-    std::this_thread::sleep_for(std::chrono::milliseconds(600));  // a few real healthy heartbeats first
+    bool timed_out = false;
+    do {
+        if (!wait_for_state(1, ConnectionState::kHealthy) || !wait_for_state(2, ConnectionState::kHealthy) ||
+            !wait_for_state(3, ConnectionState::kHealthy)) {
+            timed_out = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));  // a few real healthy heartbeats first
 
-    print_line("--- Simulator stops replying (NASDAQ only -- NYSE and LSE are never touched) ---");
-    const std::string drop_on = "drop-on\n";
-    [[maybe_unused]] ssize_t drop_on_rc = ::write(pipe_fds[1], drop_on.data(), drop_on.size());
+        print_line("--- Simulator stops replying (NASDAQ only -- NYSE and LSE are never touched) ---");
+        const std::string drop_on = "drop-on\n";
+        [[maybe_unused]] ssize_t drop_on_rc = ::write(pipe_fds[1], drop_on.data(), drop_on.size());
 
-    // No reply ever arrives for NASDAQ -> timeout detected -> HEALTHY ->
-    // DEGRADED -> miss limit reached -> DEGRADED -> FAILED. NYSE/LSE keep
-    // ticking on their own independent Connections and simulators the
-    // whole time -- the tick callback above would flag it immediately if
-    // either one so much as blinked.
-    wait_for_state(1, ConnectionState::kFailed);
+        // HEALTHY -> DEGRADED -> FAILED once the miss limit is reached.
+        if (!wait_for_state(1, ConnectionState::kFailed)) {
+            timed_out = true;
+            break;
+        }
 
-    // Restored well before reconnect_base_delay (1000ms) elapses, so the
-    // reconnect that's already scheduled will find a working peer.
-    print_line("--- Simulator becomes available again ---");
-    const std::string drop_off = "drop-off\n";
-    [[maybe_unused]] ssize_t drop_off_rc = ::write(pipe_fds[1], drop_off.data(), drop_off.size());
+        // Restored before the reconnect backoff elapses, so the retry finds a working peer.
+        print_line("--- Simulator becomes available again ---");
+        const std::string drop_off = "drop-off\n";
+        [[maybe_unused]] ssize_t drop_off_rc = ::write(pipe_fds[1], drop_off.data(), drop_off.size());
 
-    // New socket, handshake repeated, HEALTHY again -- proven here by
-    // actually observing it, not asserting it happened.
-    wait_for_state(1, ConnectionState::kHealthy);
-    std::this_thread::sleep_for(std::chrono::milliseconds(900));  // stay healthy for a visible stretch
+        // New socket and handshake, then HEALTHY again.
+        if (!wait_for_state(1, ConnectionState::kHealthy)) {
+            timed_out = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(900));  // stay healthy for a visible stretch
+    } while (false);
 
     const bool isolation_held = !others_ever_left_healthy.load(std::memory_order_relaxed);
-    std::cout << "\n=== Demonstration complete: NASDAQ's silent failure was detected, distrusted,\n"
-                 "    and recovered automatically. NYSE and LSE stayed HEALTHY throughout ("
-              << (isolation_held ? "confirmed" : "FAILED -- one of them was perturbed") << "). ===\n";
+    if (timed_out) {
+        std::cout << "\n=== Demonstration ABORTED: a state transition did not happen in time (see TIMEOUT above). ===\n";
+    } else {
+        std::cout << "\n=== Demonstration complete: NASDAQ's silent failure was detected, distrusted,\n"
+                     "    and recovered automatically. NYSE and LSE stayed HEALTHY throughout ("
+                  << (isolation_held ? "confirmed" : "FAILED -- one of them was perturbed") << "). ===\n";
+    }
 
     monitor.stop();
     monitor_thread.join();
@@ -204,5 +209,6 @@ int main() {
     }
     ::close(pipe_fds[0]);
     ::close(pipe_fds[1]);
+    if (timed_out) return 2;
     return isolation_held ? 0 : 1;
 }
