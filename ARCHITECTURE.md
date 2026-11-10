@@ -1,158 +1,79 @@
-# Vigil — Architecture
+# Vigil: Architecture
 
-A deep-reference companion to [`README.md`](README.md). Where the README makes the case for the system, this file is the engineering reference: the structural relationships, the concurrency contract, and the failure paths that a reader would otherwise have to reconstruct from the source.
+Technical reference for the monitor and simulator: components, the threading contract, the event loop, the wire protocol, the connection state machine, and failure handling. The pitch and benchmark results are in [README.md](README.md); how correctness was validated is in [METHODOLOGY.md](METHODOLOGY.md).
 
-> Diagrams are standard Mermaid, with one exception: the packet layout diagram uses `packet-beta`, a newer diagram type. GitHub and VS Code's built-in preview both render it as of 2024+; an older renderer will show raw text for that one block.
+> The packet-layout diagram uses Mermaid's `packet-beta` type, which GitHub and recent VS Code previews render; an older renderer shows raw text for that one block.
 
----
+## Design decisions
 
-## Table of contents
+- **One reactor thread, not a thread pool.** `FeedMonitor::run()` is a single `epoll_wait()` loop that owns every `Connection`. The price is a strict rule: all reactor state is touched only from that thread. The benefit is no locks, one place to reason about ordering, backoff and failure, and no scheduler jitter between feeds. Measured, it uses the same CPU as thread-per-connection and about 23% less memory (see README).
+- **Fixed-size, checksummed messages.** Every message is exactly 28 bytes, so framing is "accumulate 28 bytes, then decode": no length prefixes, no delimiters, no partial-message state machine.
+- **Trust is a state machine, not a socket property.** A half-open TCP connection looks healthy to the kernel. Each connection's `ConnectionState` is driven by heartbeat timing and treated as more authoritative than the file descriptor.
+- **Bounded everything.** Every buffer fed from the network has a cap and every cap failure has the same outcome: fail the connection cleanly rather than grow without bound or drop bytes mid-stream (which would desync a byte-oriented protocol).
 
-- [Design philosophy](#design-philosophy)
-- [Component responsibilities](#component-responsibilities)
-- [The concurrency contract](#the-concurrency-contract)
-- [Bounded-everything memory model](#bounded-everything-memory-model)
-- [Reconnection: backoff and jitter](#reconnection-backoff-and-jitter)
-- [Diagrams](#diagrams)
-  1. [Class diagram](#1-class-diagram)
-  2. [Wire packet layout](#2-wire-packet-layout)
-  3. [Concurrency ownership](#3-concurrency-ownership)
-  4. [Fault-scenario sequence](#4-fault-scenario-sequence)
-  5. [Fault tree](#5-fault-tree)
-  6. [Call graph — one byte's journey](#6-call-graph--one-bytes-journey)
+## Components
 
----
-
-## Design philosophy
-
-Three decisions shape everything else in this codebase.
-
-**One reactor thread, not a thread pool.** `FeedMonitor` runs a single `epoll_wait()` loop that owns every `Connection` it monitors. This is the direct answer to the measured result in the README: a thread-per-connection design pays real, growing OS-scheduling overhead as connection count climbs, while an event-driven reactor's cost stays close to flat. The cost of that choice is the concurrency contract below — everything touching reactor state must happen on that one thread, with no exceptions.
-
-**Fixed-size, checksummed wire messages.** Every heartbeat-protocol message is exactly 28 bytes. This removes an entire class of parsing bugs: there is no length-prefix logic, no delimiter scanning, no partial-message state machine beyond "accumulate until 28 bytes, then decode." The trade-off is protocol inflexibility, accepted deliberately for a protocol that only ever needs five message kinds.
-
-**Trust is a state machine, not a socket property.** A half-open TCP connection is indistinguishable from a healthy one at the socket-API level. Every connection's actual trust level lives in `ConnectionState`, driven entirely by heartbeat timing, and is treated as more authoritative than what the kernel reports about the underlying file descriptor.
-
-## Component responsibilities
-
-| Component | Owns | Does not do |
+| Component (`src/`) | Owns | Does not do |
 |---|---|---|
-| `Connection` | One TCP socket, its read/write buffers, its protocol state, its own liveness clock | Has no notion of other feeds; does not decide reconnect policy |
-| `FeedMonitor` | The `epoll` reactor loop, one `Slot` (and therefore one `Connection`) per feed, reconnect scheduling, alerting | Does not implement the wire protocol itself — delegates entirely to `Connection` |
-| `FeedSimulator` | A test/demo double standing in for a real exchange — a real `epoll` server accepting client connections, with injectable faults | Not part of the production monitor; exists so the monitor can be tested against real sockets without a real exchange |
-| `Stats` / `ConnectionStats` | RTT tracking (min/max/EWMA/percentile ring buffer), missed-heartbeat and reconnect counters | Has no notion of a "feed" or "connection" — a dependency-free leaf module, deliberately |
-| `Config` | Parsed, validated CLI/config-file values, every numeric field range-checked at parse time | — |
+| `Connection` (`connection.*`) | One TCP socket, its read and write buffers, its protocol state, its liveness clock. Role-agnostic: the same class is the monitor's initiator and the simulator's responder. | Know about other feeds or decide reconnect policy |
+| `FeedMonitor` (`feed_monitor.*`) | The `epoll` reactor, one `Slot` (a `Connection` plus retry bookkeeping) per feed, the timer tick, reconnect scheduling, failure alerts, operator command input | Implement the wire protocol; that is delegated to `Connection` |
+| `FeedSimulator` (`feed_simulator.*`) | A real `epoll` server standing in for an exchange feed: accepts clients, answers `PING` with `PONG`, injects faults | Run in production; it exists so the monitor can be tested against real sockets |
+| `heartbeat.*` | The 28-byte `HeartbeatMessage`, encode/decode, CRC32 | Anything stateful |
+| `Stats` (`stats.*`) | RTT min/max/EWMA (alpha 0.2), a 256-sample ring buffer for percentiles, counters for pings, acks, misses and reconnects | Know what a feed or connection is (dependency-free leaf) |
+| `Config` (`config.*`) | Defaults, `key = value` file parser with `[feed]` sections, `getopt_long` CLI; every numeric field range-checked | Abort on bad input: bad lines and flags are reported on stderr and skipped |
+| `cli_display.*` | Live table (state, last/EWMA/p99 RTT, misses, reconnects, uptime) and recent alerts; TTY redraw capped near 4 Hz, plain periodic snapshots when not a TTY | |
+| `main.cpp`, `main_simulator.cpp` | Argument handling, stdin command parsing, signal handlers, `RLIMIT_NOFILE` raised to the hard limit | |
 
-## The concurrency contract
+`FeedMonitor` stores slots in a `std::vector<Slot>` with two index maps (fd to slot, feed id to slot). Removal is swap-and-pop with the maps repointed for the moved slot.
 
-Nothing outside the reactor thread may touch reactor-owned state directly. `FeedMonitor`'s slot storage, its fd/feed-id lookup tables, and every `Connection` object are only safe to mutate from inside `FeedMonitor::run()`'s own call stack. An operator's commands reach the reactor through a dedicated pipe, processed by a callback that itself runs *on* the reactor thread when the pipe becomes readable — never a cross-thread call in disguise.
+## Threading and event loop
 
-This rule was violated twice by this project's own test code during development — never in production code — and caught both times by ThreadSanitizer. [Diagram 3](#3-concurrency-ownership) is the rule that would have prevented either mistake from being written.
+The reactor thread's `epoll` set holds every connection socket plus three auxiliary fds: a `timerfd` (the periodic tick, default 50 ms), an `eventfd` (wake-up for shutdown) and the operator command fd (stdin in the shipped binaries). Nothing else touches reactor state:
 
-## Bounded-everything memory model
-
-Every buffer that grows from network input has an explicit cap, and every cap failure has the same outcome: fail the connection cleanly rather than let something grow without bound, or silently drop bytes mid-message — which would desync a byte-oriented protocol far worse than tearing the connection down. Inbound and outbound buffers are each capped at 64KB; an unterminated command line is capped the same way. [Diagram 5](#5-fault-tree) catalogs every trigger and outcome in one place.
-
-## Reconnection: backoff and jitter
-
-A failed connection's next attempt is scheduled at `min(base_delay × 2^attempt, max_delay)`, then jittered by ±25%. The jitter exists for one specific reason: without it, many feeds failing at once — a correlated event, such as the upstream exchange itself blipping — would retry in lockstep, hammering the far end with a synchronized reconnect storm at the exact moment it's recovering.
-
----
-
-## Diagrams
-
-### 1. Class diagram
-
-The real member fields and methods of the three core classes, and the ownership relationships between them. `Connection` is deliberately unaware of anything beyond its own socket; all multi-feed bookkeeping lives one level up, in `FeedMonitor`.
+- **Signals.** The `SIGINT`/`SIGTERM` handler does an atomic store and a `write()` to the `eventfd`, both async-signal-safe, then the loop sees the stop flag. `SIGPIPE` is ignored and every `send()` uses `MSG_NOSIGNAL`.
+- **Operator commands.** The command fd is a non-blocking fd registered in the same `epoll` set; its callback runs on the reactor thread, so command handlers call the mutating methods directly with no cross-thread hop. Tests supply a pipe in place of stdin.
+- **Other threads.** Tests, benchmarks and the demo run simulators or monitors on helper threads, but each reactor is still single-threaded; code outside a reactor reaches it only through `stop()` or its command fd. ThreadSanitizer caught two violations of this rule, both in test code.
 
 ```mermaid
-classDiagram
-    class Connection {
-        -UniqueFd fd_
-        -Role role_
-        -uint32_t feed_id_
-        -string host_
-        -uint16_t port_
-        -ConnectionState state_
-        -int64_t last_liveness_ns_
-        -int consecutive_missed_
-        -vector~uint8_t~ read_accum_
-        -deque~uint8_t~ write_pending_
-        -array~uint64_t, 32~ acked_sequences_
-        -ConnectionStats stats_
-        +state() ConnectionState
-        +on_readable(now_ns)
-        +on_writable(now_ns)
-        +send_ping(now_ns)
-        +check_timeout(now_ns)
-        +queue_write(wire)
-        -handle_pong(msg, now_ns)
-        -handle_protocol_violation(reason, now_ns)
-        -drain_read_buffer(now_ns)
-    }
+flowchart TD
+    W["epoll_wait() blocks until something is ready"] --> D{"which fd?"}
 
-    class Slot {
-        +Connection connection
-        +string name
-        +int reconnect_attempts
-        +int64_t reconnect_ready_at_ns
-        +bool give_up
-        +int64_t next_ping_due_ns
-    }
+    D -->|"timerfd, every tick_interval"| T["on_timer_tick<br/>per feed: send PING if due,<br/>check_timeout, start reconnect if backoff elapsed"]
+    T --> TC["tick callback: redraw table"]
 
-    class FeedMonitor {
-        -vector~Slot~ slots_
-        -unordered_map~int, size_t~ index_of_fd_
-        -unordered_map~uint32_t, size_t~ index_of_feed_id_
-        -UniqueFd epoll_fd_
-        -Config config_
-        +add_feed(endpoint) bool
-        +remove_feed(feed_id)
-        +force_disconnect(feed_id)
-        +force_reconnect(feed_id)
-        +run()
-        +stop()
-        -schedule_reconnect(index, now_ns)
-        -reconnect_delay_ns(attempt) int64_t
-    }
+    D -->|"connection socket"| E{"event"}
+    E -->|"EPOLLIN"| RD["on_readable: recv until EAGAIN,<br/>split into 28-byte frames, decode, handle"]
+    RD --> PONG["handshake frame: move to HEALTHY<br/>valid PONG: reset liveness, record RTT,<br/>DEGRADED returns to HEALTHY"]
+    E -->|"EPOLLOUT"| WR["finish connect and send CONNECT_HELLO,<br/>or flush pending writes"]
+    E -->|"EPOLLHUP / EPOLLERR"| ERR["socket error"]
 
-    class FeedSimulator {
-        -unordered_map~int, Connection~ clients_
-        -FaultConfig faults_
-        -uint32_t feed_id_
-        +port() uint16_t
-        +run()
-        +stop()
-        +kill_random_connection()
-        +set_fault_config(faults)
-    }
+    D -->|"stdin"| CMD["read lines, dispatch command<br/>(disconnect, reconnect, set-interval, ...)"]
+    D -->|"eventfd"| STOP["wake-up: re-check stop flag"]
 
-    class ConnectionStats {
-        +int64_t last_rtt_ns
-        +double ewma_rtt_ns
-        +RingBuffer~256~ rtt_samples
-        +uint64_t reconnects
-        +uint64_t heartbeats_acked
-    }
+    RD -->|"violation or EOF"| F
+    WR -->|"send error"| F
+    ERR --> F["on_connection_failed<br/>close fd, raise alert, schedule_reconnect"]
 
-    FeedMonitor "1" *-- "many" Slot : owns
-    Slot "1" *-- "1" Connection : owns
-    FeedSimulator "1" *-- "many" Connection : owns per accepted client
-    Connection "1" *-- "1" ConnectionStats : owns
+    TC --> W
+    PONG --> W
+    WR --> W
+    F --> W
+    CMD --> W
+    STOP --> W
 ```
 
-**In plain terms:** `Connection` handles one socket's entire conversation on its own. `Slot` is just a `Connection` plus some retry bookkeeping (how many attempts so far, when to try again). `FeedMonitor` holds one `Slot` per feed it's watching. `FeedSimulator` is a separate, unrelated class — it plays the role of the exchange during testing, not the monitor's side of the conversation.
+Edge-triggered mode (the default, `EPOLLET`) requires draining each fd to `EAGAIN` on every wake-up or the connection stalls; `on_readable` and the listener's accept loop both do. A final `PONG` that arrives together with the peer's EOF is still processed before the failure is acted on. Interest in `EPOLLOUT` is armed only while a connection has queued bytes.
 
----
+Time comes from `CLOCK_BOOTTIME`, which behaves like a monotonic clock but also advances across system suspend, so a feed unreachable during a suspend reads as having missed its heartbeats.
 
-### 2. Wire packet layout
+## Wire protocol
 
-The exact byte layout of the fixed 28-byte `HeartbeatMessage`. The protocol's simplicity rests on this being fixed-size with no padding — enforced by a `static_assert` in `heartbeat.h` itself, not just asserted here.
+Every message is the same 28 bytes, big-endian, no padding (enforced by a `static_assert` in `heartbeat.h`).
 
 ```mermaid
 packet-beta
     0-15: "magic (0xFEED)"
-    16-23: "version"
+    16-23: "version (1)"
     24-31: "type"
     32-63: "feed_id"
     64-127: "sequence"
@@ -160,118 +81,73 @@ packet-beta
     192-223: "crc32 (IEEE 802.3)"
 ```
 
-**In plain terms:** every message sent between the monitor and a feed is exactly the same 28 bytes, in exactly the same order, every single time. There's no guessing where one field ends and the next begins, and no way for the two sides to lose sync about how to read a message.
+| Type | Value | Direction | Meaning |
+|---|---:|---|---|
+| `CONNECT_HELLO` | 1 | monitor to feed | First message after TCP connect; carries the feed id |
+| `CONNECT_ACK` | 2 | feed to monitor | Handshake complete |
+| `PING` | 3 | monitor to feed | Periodic heartbeat; carries a sequence and the send time (`CLOCK_BOOTTIME` ns) |
+| `PONG` | 4 | feed to monitor | Echoes the `PING`'s sequence and timestamp unchanged |
+| `DISCONNECT` | 5 | either | Graceful close notice; the receiver treats it as the peer closing |
 
----
+The CRC covers the first 24 bytes. The monitor is the only heartbeat initiator, and because it timestamps with its own clock and the feed echoes the value, round-trip time needs no clock synchronization.
 
-### 3. Concurrency ownership
+How a `PONG` is judged (`Connection::handle_pong`):
 
-Who may touch reactor state, and how everyone else has to ask.
+| Condition | Outcome |
+|---|---|
+| Wrong `feed_id`, or a sequence never sent | Protocol violation: connection fails |
+| Sequence already acknowledged (32-entry window) | Ignored |
+| Timestamp negative or in the future | Remembered as seen, not accepted as liveness |
+| Round trip at or above `heartbeat_timeout` | Remembered as seen, not accepted as liveness (a late reply does not prove current health) |
+| Otherwise | Liveness clock reset, miss counter cleared, RTT recorded; `DEGRADED` becomes `HEALTHY` |
 
-```mermaid
-flowchart TB
-    subgraph REACTOR["Reactor thread — the only thread allowed to touch these"]
-        direction TB
-        R1["FeedMonitor::run() loop"]
-        R2["slots_, index_of_fd_, index_of_feed_id_"]
-        R3["Every Connection object"]
-        R1 --> R2
-        R1 --> R3
-    end
+## Connection state machine
 
-    subgraph EXTERNAL["Everything else"]
-        direction TB
-        E1["Test thread"]
-        E2["Signal handler (SIGINT/SIGTERM)"]
-        E3["Operator's shell, via stdin"]
-    end
+The diagram is in [README.md](README.md#how-it-works). Transitions in code:
 
-    E1 -.->|"FORBIDDEN: direct call\n(caught by TSan, twice, in this project's own tests)"| R2
-    E2 -->|"atomic store + eventfd write only\n(async-signal-safe, nothing else)"| R1
-    E3 -->|"bytes on a pipe fd -> callback,\nwhich runs ON the reactor thread"| R1
-```
+| From | To | Trigger |
+|---|---|---|
+| `CONNECTING` | `HANDSHAKING` | Non-blocking `connect()` completes (`EPOLLOUT`, `SO_ERROR` clean); initiator queues `CONNECT_HELLO` |
+| `HANDSHAKING` | `HEALTHY` | Initiator receives a `CONNECT_ACK` with the right feed id (a responder answers `CONNECT_HELLO` with the ack and becomes healthy) |
+| `CONNECTING` / `HANDSHAKING` | `FAILED` | No progress for `heartbeat_timeout`, socket error, or protocol violation |
+| `HEALTHY` | `DEGRADED` | A full `heartbeat_timeout` since the last valid `PONG` (miss 1) |
+| `DEGRADED` | `HEALTHY` | A valid `PONG` |
+| `DEGRADED` | `FAILED` | `max_missed_heartbeats` misses; each further `heartbeat_timeout` without a valid `PONG` is another miss |
+| any live state | `FAILED` | Socket error, `EPOLLHUP`, peer close or `DISCONNECT`, protocol violation, operator `disconnect <id>` |
+| `FAILED` | `CONNECTING` | Backoff timer elapses; a new socket is created and the same `Connection` is rebound |
 
-**In plain terms:** only the reactor's own loop is ever allowed to change a connection's state. A test thread, a signal, or an operator typing a command can't reach in and change something directly — they can only leave a message for the reactor to act on when it's ready, which is what actually keeps this safe with no locks.
+`DISCONNECTED` also exists in the enum for a slot with no connection yet; a `Connection` itself only occupies `CONNECTING`, `HANDSHAKING`, `HEALTHY`, `DEGRADED` and `FAILED`. A `FAILED` slot waiting out its backoff is shown as `FAILED`; the table's "reconnecting" count is derived from slots that have a backoff timer armed.
 
----
+## Failure handling
 
-### 4. Fault-scenario sequence
+Every failure path ends in the same place: `on_connection_failed` removes the fd from `epoll`, closes it, raises an alert (the display callback, or `[feed_monitor] ALERT: ...` on stderr) and calls `schedule_reconnect`.
 
-A complete fault-and-recovery cycle across all four actors at once — the shape of the actual integration tests in `feed_monitor_test.cpp`, where the interesting bugs live in component interaction rather than inside any single component.
+| Trigger | Where it is caught |
+|---|---|
+| Outbound queue over 64 KB (peer not draining) | `queue_write` |
+| Inbound accumulator over 64 KB within one `on_readable()` call (flooding peer) | checked inside the recv loop, not only after draining |
+| Bad magic, version, type or CRC; desynced stream | `decode_heartbeat` returns false; buffer cleared |
+| Message invalid for the current role or state (for example `PING` before the handshake) | `handle_message` handlers |
+| Wrong `feed_id` on any message | handlers |
+| Peer EOF or `DISCONNECT` | `on_readable` / `handle_message` |
+| Operator command line over 64 KB with no newline | Discarded to the next newline; not a connection failure |
 
-```mermaid
-sequenceDiagram
-    actor Op as Operator
-    participant Sim as FeedSimulator
-    participant Mon as FeedMonitor (reactor thread)
-    participant Conn as Connection (one feed's slot)
+**Reconnect backoff.** A failed feed's next attempt is scheduled at `min(base_delay * 2^attempt, max_delay)` (exponent capped at 30), multiplied by a random factor in 0.75 to 1.25 and clamped to `max_delay`. Jitter matters because many feeds failing together (the upstream exchange blipping) would otherwise retry in lockstep and hammer the far end as it recovers. The attempt counter resets once a reconnected feed has stayed `HEALTHY` for one `heartbeat_timeout`. With `max_reconnect_attempts >= 0` the slot gives up after that many tries and stays `FAILED` until the operator types `reconnect <id>`, which clears the counter and retries immediately.
 
-    Op->>Sim: set-drop-rate 1 (stdin)
-    Note over Sim: every PONG reply now silently dropped
-    loop every heartbeat_interval
-        Conn->>Sim: PING
-        Sim--xConn: (dropped)
-    end
-    Conn->>Mon: consecutive_missed_ >= 1
-    Mon->>Conn: state = DEGRADED
-    Conn->>Mon: consecutive_missed_ >= max_missed_heartbeats
-    Mon->>Conn: state = FAILED
-    Mon->>Mon: emit_failure_alert() -> stderr
-    Mon->>Mon: schedule_reconnect() (backoff + jitter)
-    Op->>Sim: set-drop-rate 0 (stdin)
-    Mon->>Conn: initiate_connect() at reconnect_ready_at_ns
-    Conn->>Sim: CONNECT_HELLO
-    Sim-->>Conn: CONNECT_ACK
-    Mon->>Conn: state = HEALTHY
-```
+**Runtime retuning.** `set-timeout` resets every connection's liveness baseline (so shrinking the timeout cannot spuriously degrade a healthy feed); `set-interval` pulls pending ping deadlines forward if needed. Both reject values of zero or less.
 
-**In plain terms:** this is the same failure-and-recovery story as the state-machine diagram in the README, but zoomed out to show all four participants — the operator, the fake exchange, the reactor, and one connection — talking to each other, instead of just one connection's internal states in isolation.
+## Simulator and fault injection
 
----
+`FeedSimulator` is a `Connection`-per-client `epoll` server (default cap 1,024 clients, `--max-clients`). One instance serves one feed id. It reaps clients that complete no handshake or send no `PING` within its timeout, and sends `DISCONNECT` to every client on shutdown. Accepting survives file-descriptor exhaustion by keeping a spare fd to shed the pending connection, and retries on the next tick.
 
-### 5. Fault tree
+| Fault | Control | Effect |
+|---|---|---|
+| Dropped replies | `--drop-rate <0..1>`, stdin `set-drop-rate <p>` | A `PING`'s `PONG` is silently not sent; handshake traffic is unaffected |
+| Slow replies | `--extra-latency-ms`, `--jitter` | Replies are deferred (jitter scales the delay by 0.5x to 1.5x); queue capped at 4,096, overflow drops |
+| Connection reset | stdin `kill` | A random client gets an RST (`SO_LINGER` 0), exercising the socket-error path |
 
-Every path that leads to `handle_protocol_violation()` — the single chokepoint that fails a connection — alongside the one adjacent case that's rejected without tearing the connection down. Each of these was a real, empirically-reproduced bug before it was a line in this diagram.
+These are application-layer faults. The complementary kernel-level check, `scripts/network_fault_demo.sh`, applies real `tc`/`netem` loss, delay and reordering on loopback to the shipped binaries (root required, so it is not part of `make test` or CI).
 
-```mermaid
-flowchart TD
-    ROOT["handle_protocol_violation()\nsocket closed · state -> FAILED · reconnect scheduled"]
+## Configuration
 
-    A1["write_pending_ > 64KB\n(peer not draining its inbound socket buffer)"] --> ROOT
-    A2["read_accum_ > 64KB within one on_readable() call\n(peer flooding faster than drain rate)"] --> ROOT
-    A3["decode_heartbeat() fails\n(bad magic / version / type / CRC32)"] --> ROOT
-    A4["Message arrives in the wrong handshake state\n(e.g. PING before CONNECT_ACK)"] --> ROOT
-    A5["feed_id mismatch on CONNECT_HELLO / CONNECT_ACK"] --> ROOT
-    A6["Command line exceeds 64KB with no newline"] --> ROOT
-
-    B1["PONG with rtt_ns < 0\n(future-timestamped / clock-skewed)"] --> C["Rejected as evidence of health.\nRemembered as acked (no duplicate reprocessing),\nbut liveness clock is NOT reset."]
-    B2["PONG with rtt_ns >= heartbeat_timeout\n(stale straggler)"] --> C
-```
-
-**In plain terms:** every box on the left is a different way a connection can misbehave — flooding, going quiet mid-handshake, sending garbage, replying too late. No matter which one happens, the outcome is the same: the connection is closed cleanly and retried, never left sitting in a broken, half-trusted state.
-
----
-
-### 6. Call graph — one byte's journey
-
-The function-call path from `epoll_wait()` returning a readable event through to a PONG either updating a connection's liveness or being rejected. This is the path every Tier-1 hardening fix sits on — the `read_accum_` cap has to be checked *inside* the recv loop rather than only after `drain_read_buffer()` runs, because an unbounded number of `recv()` calls could already have appended to the buffer within a single `on_readable()` invocation by the time control reaches it.
-
-```mermaid
-flowchart TD
-    A["epoll_wait() returns EPOLLIN"] --> B["Connection::on_readable(now_ns)"]
-    B --> C["recv() loop until EAGAIN\n(cap checked here: read_accum_ <= 64KB, per call)"]
-    C --> D["drain_read_buffer(now_ns)\n(runs once, after the recv loop exits)"]
-    D --> E{"read_accum_.size() >= 28 bytes?"}
-    E -->|no| F["wait for more bytes next call"]
-    E -->|yes| G["decode_heartbeat(wire, &msg)"]
-    G -->|false| H["handle_protocol_violation()"]
-    G -->|true| I{"msg.type"}
-    I -->|kPong| J["handle_pong(msg, now_ns)"]
-    I -->|kConnectHello / kConnectAck| K["handshake path"]
-    I -->|kPing| L["responder auto-reply path"]
-    J --> M{"rtt_ns < 0 OR\nrtt_ns >= heartbeat_timeout?"}
-    M -->|yes, stale/invalid| N["remember_acked_sequence() only —\nNOT treated as proof of health"]
-    M -->|no, valid| O["reset last_liveness_ns_\nreset consecutive_missed_\nstats_.record_rtt()"]
-```
-
-**In plain terms:** this is the exact path one incoming network message takes, from the moment the operating system says "data is ready to read" to the moment it either updates the connection's health or gets thrown out as invalid. Nothing about a message is trusted until it's passed every check on this path.
+Precedence is CLI flags, then the `--config` file, then built-in defaults. Cross-field rules are checked after loading: `heartbeat_interval < heartbeat_timeout`, `reconnect_base_delay <= reconnect_max_delay`, `tick_interval <= heartbeat_interval`; a violating pair reverts to defaults with a warning. The format is documented in [`config/feeds.example.conf`](config/feeds.example.conf), and every flag in [All_commands.md](All_commands.md#cli-reference).

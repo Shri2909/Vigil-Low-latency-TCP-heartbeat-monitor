@@ -1,145 +1,116 @@
-# Vigil — Methodology
+# Vigil: Methodology
 
-A companion to [`ARCHITECTURE.md`](ARCHITECTURE.md) (system structure) and [`README.md`](README.md) (the pitch). This file documents a different axis: **how** this codebase was built and verified, not what it is.
+How the code's correctness and the benchmark numbers were validated, and what that process found. The system itself is described in [ARCHITECTURE.md](ARCHITECTURE.md); results and the headline claims are in [README.md](README.md).
 
----
+## Test strategy
 
-## Table of contents
+178 tests, built on a small header-only harness (`test/mini_test.h`) so the project has no external dependencies. Every test runs under every sanitizer build.
 
-- [The core discipline: revert-test, not trust-test](#the-core-discipline-revert-test-not-trust-test)
-- [Multiple independent verification layers](#multiple-independent-verification-layers)
-- [Diagrams](#diagrams)
-  1. [The revert-test discipline](#1-the-revert-test-discipline)
-  2. [Root-cause diagnosis: a case study](#2-root-cause-diagnosis-a-case-study)
-  3. [Verification matrix](#3-verification-matrix)
-  4. [Benchmark methodology timeline](#4-benchmark-methodology-timeline)
-  5. [The audit-pass cycle](#5-the-audit-pass-cycle)
+| Suite | Tests | What it covers |
+|---|---:|---|
+| `heartbeat_test` | 9 | Round trip, big-endian layout, wrong magic/version/type, single-bit corruption, CRC test vector, no padding |
+| `stats_test` | 12 | EWMA seeding, ring buffer, percentile interpolation and edge cases |
+| `config_test` | 42 | File and CLI parsing, range checks, cross-field rules, precedence, malformed input never aborting |
+| `connection_test` | 32 | State transitions at exact injected-time boundaries, handshake, PONG validation (stale, future, duplicate, reordered), buffer caps, partial reads and writes |
+| `feed_monitor_test` | 34 | Real reactor against real simulators: fault-injection scenarios, reconnect and backoff, operator commands, many feeds at once, shutdown |
+| `feed_simulator_test` | 27 | Handshake and tracking, reaping stuck or silent clients, fault injection, a 300-client burst, client cap, `EMFILE` on accept, fd-number reuse |
+| `cli_display_test` | 15 | Table formatting, dashes for missing data, control-character sanitizing, TTY vs plain rendering, alerts |
+| `e2e_binary_test` | 8 | `fork`+`exec` of the real `feed_monitor` and `feed_simulator`: live stdin commands, kill and recover, `--help`, exit codes, the shipped sample config |
 
----
+The fault-injection scenarios in `feed_monitor_test` are the ones that prove the project's purpose rather than its speed: dropped replies drive `HEALTHY` to `DEGRADED` to `FAILED` with a real alert and automatic recovery; a brief drop stays `DEGRADED` and recovers without a reconnect; replies delayed past the timeout still count as unhealthy; backoff doubles within the +/-25% jitter band and is actually randomized; 20 feeds failing at once recover independently; a healthy feed never leaves `HEALTHY`. `make demo` shows the same cycle live, with two neighbouring feeds asserted untouched.
 
-## The core discipline: revert-test, not trust-test
+### Revert-test discipline
 
-The easiest way for a regression test to lie is to pass for the wrong reason — testing something adjacent to the actual fix, or passing regardless of whether the fix exists at all. Every fix in this project's history was held to a stricter bar than "write a test, watch it pass": implement the fix, write the regression test, confirm it passes, temporarily revert *only* the fix, confirm the test now fails, restore the fix, confirm green again. A test that can't fail is not a test.
+A test can pass for the wrong reason, so each bug fix was held to a stricter bar than "test passes": write the fix and its regression test, confirm green, temporarily revert only the fix, confirm the test now fails, restore, confirm green again. This caught process bugs as well as code bugs: the first draft of the `read_accum_` cap test passed even with the fix reverted, because an older corrupt-message check was masking it.
 
-This caught its own share of process bugs, not just code bugs. A `read_accum_`-cap regression test's first draft passed even with the fix reverted, because a pre-existing corrupt-message check was masking the thing the new cap was supposed to catch — exactly the failure mode the revert step exists to surface.
+## Verification layers
 
-## Multiple independent verification layers
+No single technique finds everything, so several are layered. Each finding was verified independently before being acted on: static-analysis hits were read in context and either fixed or dismissed with a written reason.
 
-No single technique here is trusted to catch everything, because none of them can. Manual audit finds different bugs than a static analyzer; a static analyzer finds different bugs than a race detector; a race detector finds different bugs than a fresh pair of eyes with no prior context. This project layers all of them rather than picking one:
-
-| Layer | What it caught here |
+| Layer | Example of what it caught |
 |---|---|
-| Manual audit against claimed behavior | A stale PONG accepted as proof of health, despite the connection having missed real heartbeats after it was sent |
-| `clang-tidy` | Raw `atoi`/`atof` silently returning 0 on unparseable CLI input instead of signaling an error |
-| ThreadSanitizer | Two genuine data races in this project's own test code — never in production paths |
-| A fresh-eyes review with no prior context | A CPU-affinity-inheritance bug that had silently been contaminating benchmark numbers |
-| Empirical diagnosis (a hand-built, deliberately malformed input) | A future-timestamped PONG producing a negative RTT and being accepted anyway |
-
-Every one of these was verified independently before being trusted — a static-analysis finding was read in its original context and confirmed real or dismissed with a documented reason, never fixed or ignored on the tool's word alone.
-
----
-
-## Diagrams
-
-### 1. The revert-test discipline
-
-The lifecycle every bug fix in this project went through, as a state diagram rather than a linear checklist — the revert step is a genuine branch point, not a formality.
-
-```mermaid
-stateDiagram-v2
-    [*] --> Implement: bug identified
-    Implement --> WriteTest: fix written
-    WriteTest --> RunTest1: regression test written
-    RunTest1 --> Passes1: run against the fix
-    Passes1 --> Revert: confirmed passing
-    Revert --> RunTest2: fix temporarily undone\n(backup + surgical revert)
-    RunTest2 --> MustFail: run again, fix absent
-
-    MustFail --> Restore: test correctly FAILS\n(proves the test is real)
-    MustFail --> FixTheTest: test still PASSES\n(test was never testing the fix!)
-    FixTheTest --> WriteTest: redesign the test
-
-    Restore --> SanitizerSweep: fix restored
-    SanitizerSweep --> Done: ASan/UBSan + TSan clean
-    Done --> [*]
-```
-
-**In plain terms:** a bug fix isn't considered finished the moment its test passes. The test also has to be proven capable of *failing* — by temporarily undoing the fix and checking the test actually catches that. A test that would pass either way isn't really testing anything.
-
----
-
-### 2. Root-cause diagnosis: a case study
-
-One specific investigation, traced step by step: why a fuzz harness hung on long automated runs in this sandbox, while its logic had already been confirmed correct on a shorter run. A template for how an inconclusive result gets resolved here — rule out possibilities one at a time with whatever tooling is actually available, and know when to stop and document a limitation honestly rather than chase an environment quirk indefinitely.
-
-```mermaid
-flowchart TD
-    A["Fuzz harness hangs on a long run"] --> B{"Misreading an ASan report as a hang?"}
-    B -->|ruled out| C{"Stuck in a setsockopt path?"}
-    C -->|ruled out| D{"Is timeout(1)'s SIGTERM being swallowed?"}
-    D -->|ruled out| E["Measure actual CPU usage"]
-    E --> F["Near-zero — genuinely blocked, not spinning"]
-    F --> G{"Attach a debugger?"}
-    G -->|ptrace blocked in this sandbox| H["Inspect /proc/&lt;pid&gt;/wchan instead"]
-    H --> I["Blocked in anon_pipe_read —\na libFuzzer-internal thread/pipe interaction"]
-    I --> J["Cross-check: does the harness's LOGIC work at all?"]
-    J --> K["Yes — thousands of clean iterations\non an earlier, shorter run"]
-    K --> L["Conclusion: sandbox limitation,\ndocumented as such — not hidden, not chased further"]
-```
-
-**In plain terms:** rather than guessing at the cause, each possible explanation was ruled out one at a time using real evidence, and the investigation stopped at an honest, written-down conclusion instead of an assumption — including admitting the limit of what could be diagnosed in this particular environment.
-
----
-
-### 3. Verification matrix
-
-Which build variant actually ran against which category of check — a grid of checkmarks reads more honestly as a table than forced into a diagram.
-
-| Build variant | Unit + integration tests | Benchmarks | Fuzzing | Coverage |
-|---|---|---|---|---|
-| Plain (`g++ -O2`) | ✅ | ✅ | — | — |
-| ASan + UBSan | ✅ | ✅ | — | — |
-| ThreadSanitizer | ✅ | ✅ | — | — |
-| `clang++` (second compiler) | ✅ | — | ✅ | — |
-| `g++ --coverage -O0` | ✅ | — | — | ✅ |
-
-Fuzzing, notably, only ever ran under `clang++ -fsanitize=fuzzer,address` — never under ThreadSanitizer or plain `g++` — a specific, known boundary rather than an assumption.
-
-**In plain terms:** this table is a plain accounting of exactly which safety checks ran on exactly which version of the build. Nothing here is claimed to have been tested that actually wasn't — including the gaps, like fuzzing never running under the race detector.
-
----
-
-### 4. Benchmark methodology timeline
-
-The benchmarking tools' own bug history. A benchmark that measures the wrong thing is worse than no benchmark — it produces a confident, specific, wrong number. Every fix below is cited directly in `bench/`'s own source comments.
+| Manual audit against claimed behavior | A stale `PONG` accepted as proof of health after real heartbeats had been missed |
+| Hand-built malformed input | A future-timestamped `PONG` produced a negative RTT and was accepted |
+| `clang-tidy` | `atoi`/`atof` silently returning 0 on bad CLI input, so `--port abc` bound a random port |
+| ThreadSanitizer | Two data races, both in test code that called reactor methods from the wrong thread |
+| Fresh-eyes review of `bench/` | CPU-affinity inheritance that had been contaminating benchmark numbers |
+| Fuzzing | No crashes; it pins the parser invariants described below |
 
 ```mermaid
 flowchart LR
-    F7["Fixed, unrandomized trial order\nconfounded the tcp_nodelay comparison"] --> FIX7["Fixed: alternating trial order\nacross repeated repetitions"]
-    F8["CPU% conflated the monitor thread\nwith its own echo-peer thread"] --> FIX8["Fixed: per-thread CPU time via\npthread_getcpuclockid()"]
-    F9["Trial cadence was 5x more aggressive\nthan the shipped defaults"] --> FIX9["Fixed: defaults to config.h's real\ncadence, printed in the output"]
-    F10["Neither benchmark repeated a config\nmore than once — no reported variance"] --> FIX10["Fixed: min/median/max across\nrepeated repetitions, not one point"]
-    AFF["Every spawned bench thread silently\ninherited main()'s single-CPU pin"] --> FIXAFF["Fixed: explicit affinity reset\nat every spawn site, re-verified empirically"]
+    DEV["Change"] --> BUILD["make all / make test<br/>178 tests"]
+    BUILD --> WARN["make werror (g++)<br/>make CXX=clang++ werror<br/>-Wall -Wextra -Wpedantic -Werror"]
+    WARN --> SAN["Sanitizers<br/>make debug: ASan + UBSan<br/>SANITIZE=thread: TSan"]
+    SAN --> FUZZ["make fuzz-smoke<br/>libFuzzer + ASan/UBSan<br/>38 seed files"]
+    FUZZ --> CI["CI on every push<br/>runs all of the above<br/>plus clang-tidy"]
+    CI -.->|"manual, needs root"| NET["network_fault_demo.sh<br/>real tc/netem loss, delay, reorder"]
+    CI -.->|"manual"| COV["make coverage<br/>gcov per-file line %"]
 ```
 
-**In plain terms:** the code that *measures* performance was audited and fixed just as seriously as the code being measured. A benchmark that quietly measures the wrong thing is worse than having no benchmark at all — it hands you a confident, specific, wrong number instead of an honest "we don't know."
+Build variants and what ran on each:
 
----
+| Build | Tests | Benchmarks | Fuzzing | Coverage |
+|---|:-:|:-:|:-:|:-:|
+| `g++ -O2` (plain) | yes | yes | n/a | no |
+| `g++` ASan + UBSan, `-O0` | yes | no | n/a | no |
+| `g++` ThreadSanitizer, `-O1` | yes | no | n/a | no |
+| `g++` and `clang++`, `-Werror` + libstdc++ assertions | yes | no | n/a | no |
+| `clang++ -fsanitize=fuzzer,address,undefined` | n/a | no | yes | no |
+| `g++ --coverage -O0` | yes | no | n/a | yes |
 
-### 5. The audit-pass cycle
+Benchmarks only run on the plain optimized build, because sanitizers distort timing. Fuzzing is clang-only (libFuzzer) and never ran under TSan. A `clang++` + ASan/UBSan test run is possible (see [All_commands.md](All_commands.md#second-compiler-verification)) but is not part of the routine pipeline.
 
-The repeating shape behind this project's history past its initial build — not a straight line to "done," but a loop that kept finding real things to fix. This is the honest structural description of how the codebase got this far: not by getting everything right the first time, but by never treating a clean run as proof there was nothing left to find.
+### Fuzzing
+
+| Harness | Target | Invariants asserted |
+|---|---|---|
+| `decode_heartbeat_fuzz` | `decode_heartbeat` on arbitrary 28-byte buffers | A successful decode re-encodes to the exact input bytes; known-type messages survive encode/decode unchanged; unknown types are rejected |
+| `drain_read_buffer_fuzz` | `Connection`'s real recv, accumulate, parse path over a real `AF_UNIX` socketpair, arbitrary-length byte streams, both roles, chunked delivery, optional skipped handshake, EOF | No crash or sanitizer finding; a scripted handshake reaches `HEALTHY` before fuzz bytes arrive, so the fuzzer lands on the steady-state paths |
+
+Two things get inputs past the checksum: seed files with valid CRCs (`fuzz/gen_corpus.py` regenerates them) and a custom mutator that recomputes magic, version, type and CRC after each mutation. A dictionary seeds the magic and message types. CI smoke-runs each harness for 30 seconds on every push.
+
+## Benchmark methodology
+
+A benchmark that measures the wrong thing yields a confident, specific, wrong number, so the harness was audited as hard as the code.
+
+**Protocol.** Latency: 500 warmup plus 20,000 measured PING to PONG round trips, 5 repetitions per `tcp_nodelay` setting with alternating trial order, one connection in a closed loop against a real `FeedSimulator`. Throughput: one heartbeat per feed per second (the shipped default cadence, printed in the output), a settle period, then a 10-heartbeat steady-state window, 5 repetitions, reporting min/median/max. CPU is per-thread CPU time of the monitor thread (or the N worker threads for the baseline), excluding the echo peer. The naive baseline runs one connection count per process so RSS is not inflated by an earlier trial's heap high-water mark.
+
+Harness bugs found and fixed:
+
+| Flaw | Effect | Fix |
+|---|---|---|
+| Fixed trial order (`true` always before `false`) | Confounded the `tcp_nodelay` comparison with CPU-frequency warmup | Alternate trial order |
+| CPU% from process-wide `getrusage` | Charged the echo-peer thread's work to the monitor | Per-thread clock via `pthread_getcpuclockid` |
+| Trial cadence 5x faster than the shipped defaults | Every CPU% about 5x too high | Default to the real cadence |
+| One run per configuration | No variance reported | min/median/max over repetitions |
+| Every spawned thread inherited `main()`'s single-CPU pin (and `SCHED_FIFO`) | Thread-per-connection baseline crammed onto one core | Explicit affinity and scheduler reset at every spawn site |
+| Baseline thread woke 20 times a second (50 ms sleep slices) for a 1 s heartbeat | Baseline looked far more expensive than the reactor | One interruptible wait per interval |
+| Throughput harness copied a full stats snapshot every tick | Inflated the reactor's CPU and RSS | Cheap atomic callback |
+| 2 s window caught one or two synchronized ping bursts | Events/s swung 2x | 10-period window after a settle |
+| Tail percentiles computed but not printed or charted | A 42µs p99 outlier was hidden | Print and chart tails, mark the worst repetition |
+| Machine state undocumented (hybrid cores, powersave governor, thermal throttling) | Unreproducible, noisy numbers | Record tuning and placement; check throttle counters and `nstat` per run |
+
+The effect on the headline comparison:
 
 ```mermaid
 flowchart LR
-    A["Build or extend\nsomething"] --> B["Audit it adversarially\nfor gaps"]
-    B --> C{"Real gap found?"}
-    C -->|yes| D["Fix with the\nrevert-test discipline"]
-    D --> E["Full sanitizer sweep"]
-    E --> F["Document the finding"]
-    F --> A
-    C -->|no, confirmed correct| G["Record as\n'audited, confirmed correct'"]
-    G --> A
+    A["Original harness<br/>baseline woke 20x/s, per-tick snapshot copies,<br/>affinity inherited<br/>reactor looked about 5x cheaper"] --> B["Harness fixed, untuned busy machine<br/>advantage fell to about 1.5x<br/>and moved run to run"]
+    B --> C["Machine tuned, same CPU mask for both<br/>equal CPU, about 23% less RSS"]
 ```
 
-**In plain terms:** this project wasn't built once and declared finished. It was built, checked for gaps, fixed, and checked again — repeatedly — and even the passes that found nothing wrong were written down as a deliberate result, not silently skipped.
+### Placement and tuning rationale
+
+On a hybrid CPU where the threads run matters more than any software detail, so placement is part of the method and is recorded in [`bench/results/ENVIRONMENT.txt`](bench/results/ENVIRONMENT.txt).
+
+- **Governor `performance`** removes frequency ramp-up as a variable; the first trial of a pair otherwise runs on a cooler, slower clock.
+- **Latency on a P-core (CPU 0)** is the default the benchmark pins itself to; a second run on an isolated E-core (`taskset -c 4`, `isolcpus`/`nohz_full`/`rcu_nocbs`, deep C-states off, `SCHED_FIFO` via `setcap cap_sys_nice`) shows the tail with scheduler and idle-state noise removed. `setcap` is lost on every rebuild, so it runs after the build.
+- **Throughput on five non-isolated E-cores (`taskset -c 6-9,11`)**, identical for epoll and naive. Isolated cores get no load balancing, which would pile every thread of the baseline onto one core.
+- **Validity checks.** The package thermal-throttle counter must not change during a run (a first P-core run was discarded because it rose); `nstat` must show no `ListenOverflows` or `ListenDrops` and almost no retransmits; `net.core.netdev_max_backlog` is raised for the 5,000-connection runs; AC power and a quiet system.
+- **Known uncontrolled factors.** CPU frequency was not measured with `turbostat`; the laptop ran warm; VS Code stayed open but idle. The P-core run's occasional 100 to 200µs outliers have no isolated cause.
+
+## Limits of this validation
+
+- Loopback only: the numbers bound software overhead, not network behavior.
+- One machine, one session: absolute values will differ elsewhere; the relative comparisons are what to trust.
+- TSan and ASan results cover the test suite's scenarios, not arbitrary production workloads; fuzzing is time-boxed (30 s per harness in CI).
+- `network_fault_demo.sh` needs root and is manual, so CI does not exercise it.
