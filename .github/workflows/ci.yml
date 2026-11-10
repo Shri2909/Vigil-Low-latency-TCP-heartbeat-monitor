@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Read-only: nothing here writes to the repo, PRs or packages.
+permissions:
+  contents: read
+
+# A newer push to the same branch/PR cancels the run in progress.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MAKEFLAGS: -j4
+
+# Actions are pinned to major-version tags (not commit SHAs).
+
+jobs:
+  build-and-test:
+    name: Build + unit/integration tests (g++)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: make all && make test
+        run: |
+          make clean
+          make all
+          make test
+
+  werror:
+    name: Warnings as errors (${{ matrix.cxx }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++ clang
+      # -Werror plus libstdc++ assertions; builds into build-werror/ and runs the tests.
+      - name: make werror
+        run: make CXX=${{ matrix.cxx }} werror
+
+  sanitizers:
+    name: ASan + UBSan
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      # Sanitizer binaries crash at startup when vm.mmap_rnd_bits > 28 (shadow
+      # memory can't be mapped); lowering it is the documented workaround.
+      - name: Lower ASLR entropy for sanitizers
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: make debug
+        run: make debug
+
+  thread-sanitizer:
+    name: ThreadSanitizer
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lower ASLR entropy for sanitizers
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: TSan build + test
+        run: |
+          make clean
+          make SANITIZE=thread OPT="-O1 -g" test
+
+  second-compiler:
+    name: Second compiler (clang++)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang
+      - name: make CXX=clang++ test
+        run: |
+          make clean
+          make CXX=clang++ test
+
+  fuzz-smoke:
+    name: Fuzzing smoke test (30s per harness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang (libFuzzer)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang
+      - name: Lower ASLR entropy for sanitizers
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      # Runs each harness for FUZZ_TIME seconds from the committed corpus (see the Makefile).
+      - name: make fuzz-smoke
+        run: make fuzz-smoke FUZZ_TIME=30
+      - name: Upload crash/hang artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz-artifacts/
+          if-no-files-found: ignore
+
+  static-analysis:
+    name: clang-tidy (non-blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-tidy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-tidy
+      # Checks come from .clang-tidy.
+      - name: clang-tidy
+        run: clang-tidy src/*.cpp -- -std=c++20 -Isrc

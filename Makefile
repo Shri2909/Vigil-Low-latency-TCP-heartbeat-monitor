@@ -1,18 +1,43 @@
-# Low-Latency TCP Heartbeat Monitor -- build, test, and benchmark driver.
-# See PROJECT_PLAN.md section 13 for the design rationale.
+# Build, test, benchmark and fuzz driver. `make` builds both binaries.
+#
+# Knobs (override on the command line, e.g. `make OPT=-O3 bench`):
+#   OPT       optimisation level                              (default -O2)
+#   SANITIZE  comma list for -fsanitize=, used at compile and link time
+#             (e.g. thread, address,undefined)
+#   WERROR=1  warnings as errors (see `werror`)
+#   HARDEN=1  -D_GLIBCXX_ASSERTIONS (bounds-checked containers; off by default
+#             so benchmarks measure the unchecked build)
+#   DEFS      extra preprocessor definitions                  (e.g. -DDEBUG)
+#   CXXFLAGS  extra flags appended last; the core flags are not part of it, so
+#             overriding it can't drop them
+# Changing flags does not rebuild existing objects: `make clean` first.
 
-CXX      ?= g++
-CXXSTD   := -std=c++20
-WARN     := -Wall -Wextra -Wpedantic
-OPT      := -O2
-DEBUGOPT := -g -O0 -fsanitize=address,undefined -DDEBUG
-DEPFLAGS := -MMD -MP
+CXX       ?= g++
+CXXSTD    := -std=c++20
+WARNFLAGS := -Wall -Wextra -Wpedantic
+DEPFLAGS  := -MMD -MP
 
-CXXFLAGS ?= $(CXXSTD) $(WARN) $(OPT) $(DEPFLAGS)
-# -pthread is linked only because glibc's eventfd/timerfd-adjacent bits and
-# <atomic> expect it on some toolchains -- the design itself is single-threaded
-# (see PROJECT_PLAN.md finding #17), it does not spawn worker threads.
-LDFLAGS  ?= -pthread
+OPT      ?= -O2
+SANITIZE ?=
+WERROR   ?=
+HARDEN   ?=
+DEFS     ?=
+CXXFLAGS ?=
+LDFLAGS  ?=
+
+ifneq ($(SANITIZE),)
+SAN_FLAGS := -fsanitize=$(SANITIZE)
+endif
+ifneq ($(WERROR),)
+WARNFLAGS += -Werror
+endif
+ifneq ($(HARDEN),)
+HARDEN_FLAGS := -D_GLIBCXX_ASSERTIONS
+endif
+
+# Same flags for compiling and linking. -pthread: the tests use std::thread.
+ALL_FLAGS  := $(CXXSTD) $(WARNFLAGS) $(OPT) $(HARDEN_FLAGS) $(DEFS) $(DEPFLAGS) $(SAN_FLAGS) $(CXXFLAGS)
+LINK_FLAGS := $(LDFLAGS) -pthread
 
 SRC_DIR   := src
 TEST_DIR  := test
@@ -24,11 +49,12 @@ BIN_DIR   := bin
 
 INCLUDES := -I$(SRC_DIR)
 
-# --- library sources: everything in src/ except the two binary entry points ---
-ALL_SRC_CPP := $(wildcard $(SRC_DIR)/*.cpp)
+# --- sources ---
+# Library = everything in src/ except the two entry points.
+ALL_SRC_CPP  := $(wildcard $(SRC_DIR)/*.cpp)
 ENTRY_POINTS := $(SRC_DIR)/main.cpp $(SRC_DIR)/main_simulator.cpp
-LIB_SRCS  := $(filter-out $(ENTRY_POINTS),$(ALL_SRC_CPP))
-LIB_OBJS  := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/src/%.o,$(LIB_SRCS))
+LIB_SRCS     := $(filter-out $(ENTRY_POINTS),$(ALL_SRC_CPP))
+LIB_OBJS     := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/src/%.o,$(LIB_SRCS))
 
 MONITOR_OBJ   := $(BUILD_DIR)/src/main.o
 SIMULATOR_OBJ := $(BUILD_DIR)/src/main_simulator.o
@@ -36,121 +62,120 @@ SIMULATOR_OBJ := $(BUILD_DIR)/src/main_simulator.o
 TEST_SRCS := $(wildcard $(TEST_DIR)/*.cpp)
 TEST_OBJS := $(patsubst $(TEST_DIR)/%.cpp,$(BUILD_DIR)/test/%.o,$(TEST_SRCS))
 
-# bench_common.cpp is a shared helper linked into every bench binary, not a
-# binary of its own -- kept out of BENCH_BINS the same way LIB_SRCS excludes
-# the two main*.cpp entry points.
+# Each bench/*.cpp is its own binary, except bench_common.cpp (linked into all).
 BENCH_COMMON_SRC := $(BENCH_DIR)/bench_common.cpp
 BENCH_COMMON_OBJ := $(BUILD_DIR)/bench/bench_common.o
 BENCH_SRCS := $(filter-out $(BENCH_COMMON_SRC),$(wildcard $(BENCH_DIR)/*.cpp))
 BENCH_OBJS := $(patsubst $(BENCH_DIR)/%.cpp,$(BUILD_DIR)/bench/%.o,$(BENCH_SRCS))
 BENCH_BINS := $(patsubst $(BENCH_DIR)/%.cpp,$(BIN_DIR)/%,$(BENCH_SRCS))
 
-.PHONY: all test bench demo fuzz debug clean print-vars
-# Without this, GNU Make treats object files reachable only through a
-# pattern-rule chain ($(BENCH_DIR)/%.cpp -> $(BUILD_DIR)/bench/%.o ->
-# $(BIN_DIR)/%) as disposable intermediates and deletes them right after
-# linking -- correct output, but it silently defeats incremental rebuilds for
-# exactly those files (every `make bench` would recompile from scratch even
-# with no source changes). LIB_OBJS/TEST_OBJS don't need this: they're also
-# listed as explicit prerequisites of non-pattern targets elsewhere
-# (bin/feed_monitor, bin/run_tests, ...), which already exempts them.
+DEMO_OBJ := $(BUILD_DIR)/demo/lifecycle_demo.o
+
+.PHONY: all test bench demo fuzz fuzz-smoke debug werror coverage clean FORCE
+# Keep bench objects: make would otherwise delete them as pattern-rule
+# intermediates after linking, defeating incremental rebuilds.
 .SECONDARY: $(BENCH_OBJS)
 
 all: $(BIN_DIR)/feed_monitor $(BIN_DIR)/feed_simulator
 
 # --- binaries ---
 $(BIN_DIR)/feed_monitor: $(LIB_OBJS) $(MONITOR_OBJ) | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+	$(CXX) $(ALL_FLAGS) $^ -o $@ $(LINK_FLAGS)
 
 $(BIN_DIR)/feed_simulator: $(LIB_OBJS) $(SIMULATOR_OBJ) | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+	$(CXX) $(ALL_FLAGS) $^ -o $@ $(LINK_FLAGS)
 
-$(BIN_DIR)/run_tests: $(LIB_OBJS) $(TEST_OBJS) | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+# The e2e test exec()s the real binaries, so they are order-only prerequisites:
+# built first, but rebuilding them doesn't relink run_tests.
+$(BIN_DIR)/run_tests: $(LIB_OBJS) $(TEST_OBJS) | $(BIN_DIR) $(BIN_DIR)/feed_monitor $(BIN_DIR)/feed_simulator
+	$(CXX) $(ALL_FLAGS) $(LIB_OBJS) $(TEST_OBJS) -o $@ $(LINK_FLAGS)
 
-# each other bench/*.cpp is its own standalone binary, linked against the
-# library objects plus the shared bench_common.o -- via an intermediate
-# object file, same as every other binary here, so its .d dependency file
-# lands in build/bench/ instead of stray in bin/.
+$(BIN_DIR)/lifecycle_demo: $(DEMO_OBJ) $(LIB_OBJS) | $(BIN_DIR)
+	$(CXX) $(ALL_FLAGS) $^ -o $@ $(LINK_FLAGS)
+
+# Bench binaries (the explicit rules above take precedence over this pattern).
 $(BIN_DIR)/%: $(BUILD_DIR)/bench/%.o $(BENCH_COMMON_OBJ) $(LIB_OBJS) | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+	$(CXX) $(ALL_FLAGS) $^ -o $@ $(LINK_FLAGS)
 
-# --- object files ---
+# --- objects ---
+# Object directories are order-only prerequisites so `make -j` never compiles
+# before mkdir has run.
 $(BUILD_DIR)/src/%.o: $(SRC_DIR)/%.cpp | $(BUILD_DIR)/src
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+	$(CXX) $(ALL_FLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILD_DIR)/test/%.o: $(TEST_DIR)/%.cpp | $(BUILD_DIR)/test
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(TEST_DIR) -c $< -o $@
-
-# e2e_binary_test.cpp fork()+exec()s the real bin/feed_monitor and
-# bin/feed_simulator, so it needs their absolute path baked in at compile
-# time rather than guessed relative to whatever cwd run_tests happens to be
-# invoked from (an IDE run config, a sanitizer build run from a
-# subdirectory, etc. all break a cwd-relative guess). An explicit rule for
-# this one file overrides the generic pattern rule above -- same reasoning
-# as lifecycle_demo's dedicated rule elsewhere in this file.
-$(BUILD_DIR)/test/e2e_binary_test.o: $(TEST_DIR)/e2e_binary_test.cpp | $(BUILD_DIR)/test
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(TEST_DIR) -DPROJECT_BIN_DIR="\"$(abspath $(BIN_DIR))\"" -c $< -o $@
+	$(CXX) $(ALL_FLAGS) $(INCLUDES) -I$(TEST_DIR) -c $< -o $@
 
 $(BUILD_DIR)/bench/%.o: $(BENCH_DIR)/%.cpp | $(BUILD_DIR)/bench
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(BENCH_DIR) -c $< -o $@
-
-# lifecycle_demo is a single, explicitly-named binary (not a wildcard
-# pattern like the bench binaries) specifically so it can't collide with the
-# existing $(BIN_DIR)/% pattern rule above -- two pattern rules matching the
-# same target with different prerequisite sets is exactly the kind of
-# ambiguity GNU Make resolves unpredictably.
-$(BIN_DIR)/lifecycle_demo: $(BUILD_DIR)/demo/lifecycle_demo.o $(LIB_OBJS) | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+	$(CXX) $(ALL_FLAGS) $(INCLUDES) -I$(BENCH_DIR) -c $< -o $@
 
 $(BUILD_DIR)/demo/%.o: $(DEMO_DIR)/%.cpp | $(BUILD_DIR)/demo
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+	$(CXX) $(ALL_FLAGS) $(INCLUDES) -c $< -o $@
 
-# --- fuzzing harnesses (libFuzzer, clang++ only -- g++ has no
-# -fsanitize=fuzzer). Explicit rules, not a wildcard pattern, for the same
-# reason as lifecycle_demo: avoids colliding with the bench binaries'
-# $(BIN_DIR)/% pattern rule. Compiles the library sources directly into each
-# harness rather than reusing g++-built LIB_OBJS, since mixing object files
-# from two different compilers/instrumentation into one link is asking for
-# ABI or sanitizer-runtime trouble -- acceptable here because `make fuzz` is
-# a rare, manual, one-off run, not part of the regular incremental build.
-$(BIN_DIR)/decode_heartbeat_fuzz: $(FUZZ_DIR)/decode_heartbeat_fuzz.cpp $(LIB_SRCS) | $(BIN_DIR)
-	clang++ -std=c++20 -Wall -Wextra -g -O1 -fsanitize=fuzzer,address $(INCLUDES) $(FUZZ_DIR)/decode_heartbeat_fuzz.cpp $(LIB_SRCS) -o $@ -pthread
+# The e2e test gets absolute bin/source paths baked in, so it works from any cwd.
+# The stamp file changes with those paths, forcing a recompile only when needed.
+$(BUILD_DIR)/test/.bin_dir.stamp: FORCE | $(BUILD_DIR)/test
+	@echo '$(abspath $(BIN_DIR)) $(abspath .)' | cmp -s - $@ || echo '$(abspath $(BIN_DIR)) $(abspath .)' > $@
 
-$(BIN_DIR)/drain_read_buffer_fuzz: $(FUZZ_DIR)/drain_read_buffer_fuzz.cpp $(LIB_SRCS) | $(BIN_DIR)
-	clang++ -std=c++20 -Wall -Wextra -g -O1 -fsanitize=fuzzer,address $(INCLUDES) $(FUZZ_DIR)/drain_read_buffer_fuzz.cpp $(LIB_SRCS) -o $@ -pthread
+$(BUILD_DIR)/test/e2e_binary_test.o: $(TEST_DIR)/e2e_binary_test.cpp $(BUILD_DIR)/test/.bin_dir.stamp | $(BUILD_DIR)/test
+	$(CXX) $(ALL_FLAGS) $(INCLUDES) -I$(TEST_DIR) -DPROJECT_BIN_DIR="\"$(abspath $(BIN_DIR))\"" -DPROJECT_SOURCE_DIR="\"$(abspath .)\"" -c $< -o $@
 
-# --- directories ---
 $(BUILD_DIR)/src $(BUILD_DIR)/test $(BUILD_DIR)/bench $(BUILD_DIR)/demo $(BIN_DIR):
 	mkdir -p $@
 
+# --- fuzzing (libFuzzer needs clang++) ---
+# Library sources are compiled straight into each harness rather than reusing
+# the g++-built LIB_OBJS, to avoid mixing compilers and sanitizer runtimes.
+# UBSan findings abort so libFuzzer saves them as crash artifacts.
+FUZZ_CXX    ?= clang++
+FUZZ_FLAGS  := $(CXXSTD) -Wall -Wextra -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined
+FUZZ_BINS   := $(BIN_DIR)/decode_heartbeat_fuzz $(BIN_DIR)/drain_read_buffer_fuzz
+ALL_HEADERS := $(wildcard $(SRC_DIR)/*.h) $(wildcard $(FUZZ_DIR)/*.h)
+
+$(FUZZ_BINS): $(BIN_DIR)/%: $(FUZZ_DIR)/%.cpp $(LIB_SRCS) $(ALL_HEADERS) | $(BIN_DIR)
+	$(FUZZ_CXX) $(FUZZ_FLAGS) $(INCLUDES) $< $(LIB_SRCS) -o $@ -pthread
+
 # --- phony targets ---
-# feed_monitor/feed_simulator are prerequisites here (not just of run_tests)
-# because e2e_binary_test.cpp fork()+exec()s the real compiled binaries --
-# they need to exist on disk before run_tests executes, even though
-# run_tests itself doesn't link against them.
-test: $(BIN_DIR)/run_tests $(BIN_DIR)/feed_monitor $(BIN_DIR)/feed_simulator
+test: $(BIN_DIR)/run_tests
 	./$(BIN_DIR)/run_tests
 
 bench: $(BENCH_BINS)
 
 demo: $(BIN_DIR)/lifecycle_demo
 
-fuzz: $(BIN_DIR)/decode_heartbeat_fuzz $(BIN_DIR)/drain_read_buffer_fuzz
+fuzz: $(FUZZ_BINS)
 
+# Time-boxed run of each harness on the committed corpus (usage: make fuzz-smoke
+# FUZZ_TIME=60). New inputs go to $(FUZZ_WORK), never the committed corpus;
+# crashes land in $(FUZZ_ARTIFACTS). `timeout` is a hard backstop.
+FUZZ_TIME      ?= 20
+FUZZ_WORK      := fuzz-work
+FUZZ_ARTIFACTS := fuzz-artifacts
+fuzz-smoke: fuzz
+	@mkdir -p $(FUZZ_ARTIFACTS)
+	@for h in $(notdir $(FUZZ_BINS)); do \
+		mkdir -p $(FUZZ_WORK)/$$h; \
+		echo "=== $$h ($(FUZZ_TIME)s) ==="; \
+		timeout $$(( $(FUZZ_TIME) + 60 )) ./$(BIN_DIR)/$$h -max_total_time=$(FUZZ_TIME) -timeout=10 \
+			-close_fd_mask=3 -dict=$(FUZZ_DIR)/heartbeat.dict -artifact_prefix=$(FUZZ_ARTIFACTS)/$$h- \
+			$(FUZZ_WORK)/$$h $(FUZZ_DIR)/corpus/$$h || exit 1; \
+	done
+
+# ASan + UBSan at -O0 after a clean (sanitized objects must not mix with a normal build).
 debug:
 	$(MAKE) clean
-	$(MAKE) CXXFLAGS="$(CXXSTD) $(WARN) $(DEBUGOPT) $(DEPFLAGS)" LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" all test
+	$(MAKE) OPT="-g -O0" DEFS="-DDEBUG" SANITIZE=address,undefined HARDEN=1 all test
 
-# Measured line coverage, not just a test count. lcov/genhtml aren't
-# installed on this machine (confirmed) but gcov is -- no HTML report, just
-# gcov's own per-file summary. Rebuilds everything with --coverage so
-# main.cpp/main_simulator.cpp (exercised as real subprocesses by
-# e2e_binary_test.cpp, not linked into run_tests itself) get real coverage
-# data too, not just the library sources run_tests links directly.
+# -Werror build + tests (with HARDEN) in separate dirs, leaving the normal build
+# alone. `make CXX=clang++ werror` does the same with clang.
+werror:
+	$(MAKE) BUILD_DIR=build-werror BIN_DIR=bin-werror WERROR=1 HARDEN=1 all test
+
+# Clean --coverage rebuild, run tests, print per-file gcov line coverage. The
+# entry points are covered only through the e2e subprocess tests.
 coverage:
 	$(MAKE) clean
-	$(MAKE) CXXFLAGS="$(CXXSTD) $(WARN) -g -O0 --coverage $(DEPFLAGS)" LDFLAGS="--coverage -pthread" all test
+	$(MAKE) OPT="-g -O0" CXXFLAGS="--coverage" all test
 	@echo ""
 	@echo "=== per-file line coverage (gcov) ==="
 	@for f in $(ALL_SRC_CPP); do \
@@ -159,11 +184,6 @@ coverage:
 	@rm -f *.gcov
 
 clean:
-	rm -rf $(BUILD_DIR) $(BIN_DIR)
+	rm -rf $(BUILD_DIR) $(BIN_DIR) build-werror bin-werror fuzz-work fuzz-artifacts
 
-print-vars:
-	@echo "LIB_SRCS   = $(LIB_SRCS)"
-	@echo "TEST_SRCS  = $(TEST_SRCS)"
-	@echo "BENCH_SRCS = $(BENCH_SRCS)"
-
--include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(MONITOR_OBJ:.o=.d) $(SIMULATOR_OBJ:.o=.d) $(BENCH_COMMON_OBJ:.o=.d) $(BENCH_OBJS:.o=.d) $(BUILD_DIR)/demo/lifecycle_demo.d
+-include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(MONITOR_OBJ:.o=.d) $(SIMULATOR_OBJ:.o=.d) $(BENCH_COMMON_OBJ:.o=.d) $(BENCH_OBJS:.o=.d) $(DEMO_OBJ:.o=.d)

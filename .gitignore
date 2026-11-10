@@ -1,11 +1,26 @@
+# build output
 build/
 bin/
+build-*/
+bin-*/
 *.o
 *.d
+
+# coverage / fuzzing
 *.gcda
 *.gcno
 *.gcov
 crash-*
 leak-*
 oom-*
+fuzz-work/
+fuzz-artifacts/
+
+# tooling
 .claude/
+.vscode/
+.cache/
+compile_commands.json
+__pycache__/
+
+PROJECT_PROFILE.md

@@ -1,0 +1,11 @@
+# bugprone, performance and clang-analyzer families; two noisy checks that fire
+# on every same-typed parameter pair / small enum are disabled.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  performance-*,
+  -performance-enum-size,
+  clang-analyzer-*
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*/src/.*'
